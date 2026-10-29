@@ -1,147 +1,341 @@
-"""Saudi AI Sniper V5: TASI universe discovery and research candidate selection.
 
-Does not place orders, send Telegram notifications, or promise live pricing.
-Free SAHMK plan: directory is used for universe discovery; individual quotes
-are optional and limited by a configurable budget. Historical data still
-comes from existing sniper_core.daily() / calculate().
+"""Saudi AI Sniper V5 - TASI market scanner.
+Historical/delayed data only. No automatic orders.
 """
-from __future__ import annotations
 
 import json
 import os
+import warnings
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"The inplace keyword .* is deprecated",
+    module=r"yfinance\..*",
+)
+
 BASE_URL = "https://api.sahmk.sa/api/v1"
-MAX_DIRECTORY_PAGES = 10
-DEFAULT_QUOTE_BUDGET = 5
+MIN_LIQUIDITY_M_SAR = 20.0
 
 
-def _session():
-    s = requests.Session()
+def sahmk_session():
     key = os.getenv("SAHMK_API_KEY", "").strip()
-    if key:
-        s.headers.update({"X-API-Key": key})
-    return s
+    if not key:
+        raise RuntimeError("SAHMK_API_KEY is missing")
+    session = requests.Session()
+    session.headers.update({"X-API-Key": key})
+    return session
 
 
 def tasi_equities(session=None):
-    """Retrieve active TASI equities only; fail closed on missing API access."""
-    if not os.getenv("SAHMK_API_KEY", "").strip() and session is None:
-        raise RuntimeError("SAHMK_API_KEY is missing; add it to GitHub Actions secrets")
-    session = session or _session()
+    session = session or sahmk_session()
     symbols = {}
     offset = 0
-    for _ in range(MAX_DIRECTORY_PAGES):
+
+    for _ in range(10):
         response = session.get(
             f"{BASE_URL}/companies/",
-            params={"market": "TASI", "limit": 500, "offset": offset},
+            params={
+                "market": "TASI",
+                "limit": 500,
+                "offset": offset,
+            },
             timeout=25,
         )
         response.raise_for_status()
         payload = response.json()
-        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-            raise RuntimeError("Unexpected SAHMK company directory response")
-        rows = payload["results"]
-        for item in rows:
-            if not isinstance(item, dict):
+
+        rows = payload.get("results")
+        if not isinstance(rows, list):
+            raise RuntimeError("Invalid SAHMK response")
+
+        for company in rows:
+            if not isinstance(company, dict):
                 continue
-            symbol = str(item.get("symbol", "")).strip()
+
+            symbol = str(
+                company.get("symbol", "")
+            ).strip()
+
             if (
-                item.get("market") == "TASI"
-                and str(item.get("status", "")).lower() == "active"
-                and str(item.get("security_type", "")).lower() == "equity"
-                and item.get("is_etf") is not True
+                company.get("market") == "TASI"
+                and str(
+                    company.get("status", "")
+                ).lower() == "active"
+                and str(
+                    company.get("security_type", "")
+                ).lower() == "equity"
+                and company.get("is_etf") is not True
                 and symbol.isdigit()
             ):
-                symbols[symbol] = item.get("name_ar") or item.get("name_en") or symbol
+                symbols[symbol] = (
+                    company.get("name_ar")
+                    or company.get("name_en")
+                    or symbol
+                )
+
         offset += len(rows)
         total = payload.get("total")
-        if not rows or (isinstance(total, int) and offset >= total) or len(rows) < 500:
+
+        if not rows or (
+            isinstance(total, int)
+            and offset >= total
+        ) or len(rows) < 500:
             break
     else:
-        raise RuntimeError("SAHMK company directory pagination exceeded safety cap")
+        raise RuntimeError("Too many directory pages")
+
     if not symbols:
-        raise RuntimeError("No valid TASI equities returned; refusing to use an empty list")
+        raise RuntimeError("No TASI stocks found")
+
     return symbols
 
 
-def rank_universe(symbols, max_candidates=50):
-    """Rank historical setups; a high score is not a validated buy signal."""
+def scan_universe(symbols, max_candidates=50):
     from sniper_core import daily, calculate
 
-    candidates = []
-    errors = []
-    for symbol, name in symbols.items():
+    stats = Counter()
+    failures = []
+    scored = []
+
+    for index, (symbol, company) in enumerate(
+        symbols.items(), 1
+    ):
         try:
             candles = daily(symbol)
+
             if candles is None or candles.empty:
-                errors.append(symbol)
+                stats["missing_history"] += 1
+                failures.append(symbol)
                 continue
-            item = calculate(symbol, candles)
-            if not item:
-                errors.append(symbol)
+
+            result = calculate(symbol, candles)
+
+            if not isinstance(result, dict):
+                stats["analysis_failed"] += 1
+                failures.append(symbol)
                 continue
-            score = float(item.get("Ø¯Ø±Ø¬Ø©_Ø§ÙØ¬ÙØ¯Ø©") or 0)
-            liquidity = float(item.get("ÙÙÙØ©_Ø§ÙØªØ¯Ø§ÙÙ_Ø§ÙÙÙÙÙØ©_Ø§ÙÙØªÙØ³Ø·Ø©_ÙÙÙÙÙ") or 0)
-            item = dict(item)
-            item["Ø§Ø³Ù_Ø§ÙØ´Ø±ÙØ©"] = name
-            if liquidity >= 20:
-                candidates.append((score, liquidity, item))
+
+            stats["analyzed"] += 1
+            item = dict(result)
+            item["اسم_الشركة"] = company
+
+            score = float(
+                item.get("درجة_الجودة") or 0
+            )
+            liquidity = float(
+                item.get(
+                    "قيمة_التداول_اليومية_المتوسطة_مليون"
+                ) or 0
+            )
+
+            liquid = (
+                liquidity >= MIN_LIQUIDITY_M_SAR
+            )
+
+            if liquid:
+                stats["liquid"] += 1
+            else:
+                stats["below_liquidity_threshold"] += 1
+
+            validated = (
+                liquid
+                and item.get("الحالة") == "فرصة مشروطة"
+            )
+
+            if validated:
+                stats["validated_setups"] += 1
+
+            item["تصنيف_الماسح"] = (
+                "فرصة مشروطة"
+                if validated
+                else "مراقبة فقط"
+            )
+            item["مستوفي_شرط_السيولة"] = liquid
+
+            scored.append((
+                validated,
+                liquid,
+                score,
+                liquidity,
+                item,
+            ))
+
         except Exception as exc:
-            errors.append(symbol)
-            print(f"WARN {symbol}: {type(exc).__name__}")
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    return [x[2] for x in candidates[:max_candidates]], errors
+            stats["exceptions"] += 1
+            failures.append(symbol)
+            print(
+                f"WARN {symbol}: "
+                f"{type(exc).__name__}: "
+                f"{str(exc)[:120]}",
+                flush=True,
+            )
+
+        if index % 50 == 0:
+            print(
+                f"Progress: {index}/{len(symbols)}; "
+                f"analyzed={stats['analyzed']}; "
+                f"failed={len(failures)}",
+                flush=True,
+            )
+
+    scored.sort(
+        key=lambda row: row[:4],
+        reverse=True,
+    )
+
+    top = [
+        row[4]
+        for row in scored[:max(0, int(max_candidates))]
+    ]
+
+    stats["universe_size"] = len(symbols)
+    stats["failed_total"] = len(failures)
+    stats["watchlist_returned"] = len(top)
+    stats["watchlist_liquid"] = sum(
+        1 for item in top
+        if item["مستوفي_شرط_السيولة"]
+    )
+
+    return top, failures, dict(stats)
 
 
-def verify_quotes(candidates, session=None, budget=DEFAULT_QUOTE_BUDGET):
-    """Optional individual SAHMK delayed quotes, max `budget` API calls.
+def rank_universe(symbols, max_candidates=50):
+    ranked, failed, _ = scan_universe(
+        symbols, max_candidates
+    )
+    return ranked, failed
 
-    Never upgrades historical candidate to 'buy' from an unverified or delayed quote.
-    """
-    if not os.getenv("SAHMK_API_KEY", "").strip() and session is None:
-        raise RuntimeError("SAHMK_API_KEY missing")
-    session = session or _session()
+
+def verify_quotes(candidates, session=None, budget=0):
     budget = max(0, min(int(budget), 20))
+
+    if budget == 0:
+        return {}
+
+    session = session or sahmk_session()
     quotes = {}
+
     for item in candidates[:budget]:
-        symbol = str(item["Ø§ÙØ³ÙÙ"])
+        symbol = str(item["السهم"])
+
         try:
-            resp = session.get(f"{BASE_URL}/quote/{symbol}/", timeout=20)
-            if resp.status_code in (401, 403, 429):
-                print(f"SAHMK quote budget/permission limit: HTTP {resp.status_code}; stopped")
+            response = session.get(
+                f"{BASE_URL}/quote/{symbol}/",
+                timeout=20,
+            )
+
+            if response.status_code in (401, 403, 429):
+                print(
+                    f"SAHMK HTTP {response.status_code}"
+                )
                 break
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, dict) or str(data.get("symbol")) != symbol:
+
+            response.raise_for_status()
+            payload = response.json()
+
+            if (
+                not isinstance(payload, dict)
+                or str(payload.get("symbol")) != symbol
+            ):
                 continue
+
             quotes[symbol] = {
-                "price": data.get("price"), "volume": data.get("volume"),
-                "updated_at": data.get("updated_at"),
-                "is_delayed": data.get("is_delayed", True),
+                key: payload.get(key)
+                for key in (
+                    "price",
+                    "volume",
+                    "updated_at",
+                    "is_delayed",
+                )
             }
+
         except requests.RequestException as exc:
-            print(f"WARN quote {symbol}: {type(exc).__name__}")
+            print(
+                f"WARN quote {symbol}: "
+                f"{type(exc).__name__}"
+            )
+
     return quotes
 
 
-def run(max_candidates=50, quote_budget=DEFAULT_QUOTE_BUDGET):
+def run(max_candidates=50, quote_budget=0):
     symbols = tasi_equities()
-    ranked, failed = rank_universe(symbols, max_candidates=max_candidates)
-    quotes = verify_quotes(ranked, budget=quote_budget)
-    result = {
-        "scanned_at_utc": datetime.now(timezone.utc).isoformat(),
-        "market": "TASI", "universe_size": len(symbols),
-        "historical_candidates": ranked, "historical_failures": failed,
+
+    ranked, failed, stats = scan_universe(
+        symbols, max_candidates
+    )
+
+    quotes = verify_quotes(
+        ranked, budget=quote_budget
+    )
+
+    report = {
+        "scanned_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "market": "TASI",
+        "universe_size": len(symbols),
+        "summary": stats,
+        "historical_candidates": ranked,
+        "historical_failures": failed,
         "sahmk_quotes": quotes,
-        "note": "Research only: SAHMK Free quotes are delayed; no orders or Telegram messages sent.",
+        "note": (
+            "Watchlist is not a buy signal. "
+            "Historical/delayed data only."
+        ),
     }
-    Path("market_scan_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"TASI equities: {len(symbols)} | selected: {len(ranked)} | historical failures: {len(failed)} | SAHMK quotes: {len(quotes)}")
-    return result
+
+    Path("market_scan_result.json").write_text(
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+
+    lines = [
+        "SAUDI AI SNIPER - FULL MARKET SCAN",
+        f"Discovered: {len(symbols)}",
+        f"Actually analyzed: {stats.get('analyzed', 0)}",
+        f"Missing history: {stats.get('missing_history', 0)}",
+        f"Analysis failures: {stats.get('analysis_failed', 0)}",
+        f"Exceptions: {stats.get('exceptions', 0)}",
+        f"Historical failures total: {len(failed)}",
+        f"Passed liquidity filter: {stats.get('liquid', 0)}",
+        f"Below liquidity filter: {stats.get('below_liquidity_threshold', 0)}",
+        f"Validated setups: {stats.get('validated_setups', 0)}",
+        f"Watchlist returned: {len(ranked)}",
+        f"SAHMK quotes retrieved: {len(quotes)}",
+        "TOP 10 WATCHLIST:",
+    ]
+
+    for item in ranked[:10]:
+        lines.append(
+            f"{item.get('السهم')} | "
+            f"score={item.get('درجة_الجودة')} | "
+            f"{item['تصنيف_الماسح']}"
+        )
+
+    Path("market_scan_summary.txt").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+    print("\n".join(lines), flush=True)
+
+    if stats.get("analyzed", 0) == 0:
+        raise RuntimeError(
+            "No stocks were actually analyzed"
+        )
+
+    return report
 
 
 if __name__ == "__main__":

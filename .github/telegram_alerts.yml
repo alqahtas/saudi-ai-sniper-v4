@@ -1,0 +1,46 @@
+name: Saudi AI Sniper Telegram Alerts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 7-12 * * 0-4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-sniper-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check Telegram configuration
+        env:
+          TELEGRAM_BOT_TOKEN: $&#123;&#123; secrets.TELEGRAM_BOT_TOKEN &#125;&#125;
+          TELEGRAM_CHAT_ID: $&#123;&#123; secrets.TELEGRAM_CHAT_ID &#125;&#125;
+        run: |
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo "Missing BOT TOKEN"; exit 1; }
+          test -n "$TELEGRAM_CHAT_ID" || { echo "Missing CHAT ID"; exit 1; }
+
+      - name: Scan stocks and notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: $&#123;&#123; secrets.TELEGRAM_BOT_TOKEN &#125;&#125;
+          TELEGRAM_CHAT_ID: $&#123;&#123; secrets.TELEGRAM_CHAT_ID &#125;&#125;
+          TZ: Asia/Riyadh
+        run: python telegram_scan.py

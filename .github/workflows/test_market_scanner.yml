@@ -7,7 +7,7 @@ on:
 jobs:
   test-market:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -21,20 +21,43 @@ jobs:
       - name: Install dependencies
         run: pip install requests yfinance pandas numpy
 
-      - name: Test SAHMK market directory
+      - name: Scan entire TASI market
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
         run: |
-          python - <<'PY'
-          from market_scanner import tasi_equities, rank_universe
+          python -u - <<'PY'
+          from market_scanner import run
 
-          symbols = tasi_equities()
-          print("TASI stocks found:", len(symbols))
-          print("First 5 symbols:", list(symbols)[:5])
+          result = run(
+              max_candidates=50,
+              quote_budget=0
+          )
 
-          sample = dict(list(symbols.items())[:5])
-          ranked, errors = rank_universe(sample, max_candidates=5)
-          print("Candidates:", len(ranked))
-          print("Historical failures:", errors)
-          print("MARKET SCANNER TEST COMPLETED")
+          total = result["universe_size"]
+          failed = len(result["historical_failures"])
+          selected = len(result["historical_candidates"])
+
+          print("TASI stocks found:", total)
+          print("Successfully analyzed:", total - failed)
+          print("Historical failures:", failed)
+          print("Top candidates:", selected)
+
+          for stock in result["historical_candidates"][:10]:
+              print(
+                  stock["السهم"],
+                  stock["اسم_الشركة"],
+                  "Score:", stock["درجة_الجودة"],
+                  "Status:", stock["الحالة"]
+              )
+
+          if total == 0 or total - failed == 0:
+              raise RuntimeError("No stocks analyzed")
           PY
+
+      - name: Save market scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tasi-market-scan
+          path: market_scan_result.json
+          if-no-files-found: warn

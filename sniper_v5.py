@@ -77,7 +77,7 @@ def evaluate(d: pd.DataFrame, signal_index: int, holding_bars: int = 15,
              risk_atr: float = 1.5, reward_r: float = 2.0,
              trading_cost_pct: float = 0.003) -> Optional[Outcome]:
     """Enter at next day's open. Conservative when stop & target touch in same bar."""
-    if signal_index + holding_bars + 1 >= len(d):
+    if signal_index + holding_bars >= len(d):
         return None
     row = d.iloc[signal_index]
     atr = float(row['atr'])
@@ -118,7 +118,7 @@ def historical_stats(d: pd.DataFrame, strategy: str, lookback_days: int=1260,
     start = max(210,len(d)-lookback_days)
     outcomes=[]
     last_entry=-999
-    for i in range(start, len(d)-holding_bars-1):
+    for i in range(start, len(d)-holding_bars):
         if not bool(d[strategy].iloc[i]) or i-last_entry <= holding_bars:
             continue
         res=evaluate(d,i,holding_bars=holding_bars)
@@ -127,12 +127,13 @@ def historical_stats(d: pd.DataFrame, strategy: str, lookback_days: int=1260,
             last_entry=i
     if not outcomes:
         return {'samples':0,'win_rate_pct':None,'mean_return_pct':None,
-                'worst_return_pct':None,'outcomes':[]}
+                'worst_return_pct':None,'target_hit_rate_pct':None,'outcomes':[]}
     returns = [x.return_pct for x in outcomes]
     return {'samples':len(outcomes),
             'win_rate_pct':round(100*sum(x>0 for x in returns)/len(returns),1),
             'mean_return_pct':round(float(np.mean(returns)),2),
             'worst_return_pct':round(float(np.min(returns)),2),
+            'target_hit_rate_pct':round(100*sum(x.outcome in ('target','target_gap') for x in outcomes)/len(outcomes),1),
             'outcomes':[x.__dict__ for x in outcomes]}
 
 
@@ -150,6 +151,24 @@ def analyze(ticker: str, data: pd.DataFrame) -> dict:
     levels=bool(last['Close']>last['support20'] and last['Close']<last['resistance60']*1.05)
     # This is an explainable signal-quality score, NOT a predicted win probability.
     score=sum([25*liquid,20*trend,15*vol,15*momentum,10*levels,15*bool(current)])
+    # Candidate LIMIT levels use the historical close as reference, not a live quote.
+    # ATR stop and targets are indicative and must be checked against exchange ticks.
+    last_close = float(last['Close'])
+    atr = float(last['atr'])
+    support = float(last['support20'])
+    resistance = float(last['resistance60'])
+    entry = stop = target1 = target2 = None
+    rr1 = None
+    if current and np.isfinite(atr) and atr > 0 and np.isfinite(support):
+        candidate = min(last_close * 0.995, max(support * 1.005, last_close - 0.25 * atr))
+        risk = max(1.5 * atr, candidate - support + 0.25 * atr)
+        if 0 < candidate < last_close and 0 < candidate-risk:
+            entry = round(candidate, 3)
+            stop = round(candidate-risk, 3)
+            # Targets must exceed entry and have useful R:R; avoid made-up price forecasts.
+            target1 = round(candidate + 2*risk, 3)
+            target2 = round(candidate + 3*risk, 3)
+            rr1 = 2.0
     # No historical win-rate is used to inflate score when sample sizes are small.
     return {'ticker':ticker,'date':str(d.index[-1].date()),'close':round(float(last['Close']),3),
        'support20':round(float(last['support20']),3),'support60':round(float(last['support60']),3),
@@ -159,6 +178,9 @@ def analyze(ticker: str, data: pd.DataFrame) -> dict:
        'avg_turnover_m_sar':round(float(last['turnover20'])/1e6,1),
        'atr14':round(float(last['atr']),3), 'quality_score_100':int(score),
        'active_strategies':current,'backtests':stats,
+       'entry_reference':entry,'stop_reference':stop,
+       'target1_reference':target1,'target2_reference':target2,
+       'reward_risk_target1':rr1,
        'notes':'Historical daily-price research only; no real-time order flow or verified probability.'}
 
 

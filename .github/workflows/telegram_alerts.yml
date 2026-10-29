@@ -34,7 +34,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: 
+        run: |
           test -n "$TELEGRAM_BOT_TOKEN" || { echo "Missing BOT TOKEN"; exit 1; }
           test -n "$TELEGRAM_CHAT_ID" || { echo "Missing CHAT ID"; exit 1; }
 

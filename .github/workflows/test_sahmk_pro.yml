@@ -1,0 +1,30 @@
+
+name: Test SAHMK Pro
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Test SAHMK Pro market data
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: python -u sahmk_pro.py

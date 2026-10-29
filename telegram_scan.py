@@ -1,5 +1,4 @@
-
-"""Saudi AI Sniper V5 - TASI-aware Telegram alerts.
+"Saudi AI Sniper V5 - TASI-aware Telegram alerts.
 Read-only. No automatic trading orders.
 """
 

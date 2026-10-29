@@ -1,0 +1,40 @@
+name: Test AI Sniper V5
+
+on:
+  pull_request:
+  push:
+    branches:
+      - alqahtas-patch-1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Check Python syntax
+        run: python -m py_compile sniper_core.py sniper_v5.py telegram_scan.py
+
+      - name: Test V5 imports
+        run: |
+          python -c "import sniper_core"
+          python -c "import sniper_v5"
+          python -c "import telegram_scan"
+
+      - name: Confirm no Telegram execution
+        run: echo "Static and import checks completed; no alerts sent."

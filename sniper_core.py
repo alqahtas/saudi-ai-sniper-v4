@@ -1,77 +1,61 @@
-"""Saudi AI Sniper V4 — Tadawul manual-entry scanner.
-Educational research, no orders, no broker authentication, no background alerts.
-Historical daily data from Yahoo Finance via yfinance: not exchange-grade real-time.
+"""V5 bridge: keep existing Streamlit imports and telegram scanner compatible.
+Historical daily data, no live prices, no automatic orders.
 """
 from datetime import datetime
-from pathlib import Path
 import numpy as np
-import pandas as pd
+from sniper_v5 import analyze, download_daily
 
-# Candidate watchlist only: NOT a verified current top-30 by capitalization or liquidity.
 WATCHLIST = '2222 1120 1180 1150 1010 1050 2010 2020 1211 7010 7020 7030 2082 2083 5110 4001 4002 4003 4004 4005 4006 4013 4164 4200 4300 7200 7202 7203 7204 8010'.split()
-CAPITAL_SAR = 50_000
-MAX_ENTRY_SAR = 10_000
-RISK_PER_TRADE_SAR = 150  # 0.3% of earmarked capital; cap, not a guarantee
-STOP_LOSS_PCT = .015
-MIN_AVG_VALUE_SAR = 20_000_000  # historical 20d value volume proxy, NOT order-book liquidity
-MIN_REL_VOLUME = 1.10
-MIN_RR = 1.5
-SUPPORT_WINDOW = 30
+CAPITAL_SAR=50_000
+MAX_ENTRY_SAR=10_000
+RISK_PER_TRADE_SAR=150
+STOP_LOSS_PCT=.015
+MIN_AVG_VALUE_SAR=20_000_000
+MIN_REL_VOLUME=1.10
+MIN_RR=1.5
+SUPPORT_WINDOW=30
 
 
 def daily(ticker):
-    import yfinance as yf
-    d = yf.download(ticker + '.SR', period='9mo', interval='1d', auto_adjust=False,
-                    progress=False, threads=False, timeout=12, multi_level_index=False)
-    if d is None or len(d)<75: return None
-    cols=['Open','High','Low','Close','Volume']
-    if not set(cols).issubset(d.columns): return None
-    d=d[cols].apply(pd.to_numeric,errors='coerce').dropna()
-    return d if len(d)>=75 else None
+    try:
+        d=download_daily(ticker,years=5)
+        if d is None or len(d)<230: return None
+        return d
+    except Exception:
+        return None
 
 
 def calculate(ticker,d):
-    last=d.iloc[-1]; prev=d.iloc[:-1]
-    price=float(last['Close']); op=float(last['Open']); hi=float(last['High']); low=float(last['Low'])
-    if min(price,op,hi,low)<=0: return None
-    support=float(prev['Low'].tail(SUPPORT_WINDOW).min())
-    resistance=float(prev['High'].tail(40).max())
-    volavg=float(prev['Volume'].tail(20).mean())
-    relvol=float(last['Volume']/volavg) if volavg>0 else 0
-    avgvalue=float((prev['Close']*prev['Volume']).tail(20).mean())
-    ema20=float(d['Close'].ewm(span=20,adjust=False).mean().iloc[-1]); ema50=float(d['Close'].ewm(span=50,adjust=False).mean().iloc[-1])
-    delta=d['Close'].diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-    rs=float(gain.iloc[-1]/max(loss.iloc[-1],1e-10)); rsi=100-100/(1+rs)
-    candle_range=max(hi-low,0.00001); lowerwick=(min(op,price)-low)/candle_range; closepos=(price-low)/candle_range
-    # Support test must touch support zone and close ABOVE it; avoid presumed rebounds based on last price alone.
-    touched=low<=support*1.012 and low>=support*0.975
-    confirmation=(price>op and closepos>=.65 and lowerwick>=.20)
-    trend=(price>=ema50*.97 and ema20>=ema50*.97)
-    liquid=(avgvalue>=MIN_AVG_VALUE_SAR)
-    volgood=(relvol>=MIN_REL_VOLUME)
-    # The requested manual limit BUY range is ALWAYS below the historical reference close.
-    upper=min(price*.995, support*1.012)
-    lower=support*1.002
-    valid_range=(upper>lower>0 and upper<price)
-    entry=(lower+upper)/2 if valid_range else np.nan
-    stop=entry*(1-STOP_LOSS_PCT) if valid_range else np.nan
-    # Stop should be below the identified historical support, not through the middle of it.
-    valid_stop=valid_range and stop<support and (entry-support)/entry<STOP_LOSS_PCT
-    potential_target=resistance
-    rr=(potential_target-entry)/(entry-stop) if valid_range and entry>stop else 0
-    # Fair conservative sizing: execution and stop gap can exceed expected loss.
-    shares=min(int(MAX_ENTRY_SAR//entry),int(RISK_PER_TRADE_SAR//(entry-stop))) if valid_range else 0
-    conditions={
-      'سيولة تاريخية': liquid,'ارتداد قرب دعم': touched,'شمعة تأكيد': confirmation,
-      'تدفق حجم نسبي': volgood,'اتجاه فني':trend,'نطاق دون الإغلاق':valid_range,
-      'وقف أسفل الدعم':valid_stop,'عائد/مخاطرة':rr>=MIN_RR,'حجم صفقة ممكن':shares>=1
+    a=analyze(ticker,d)
+    if a.get('error'): return None
+    price=float(a['close']); atr=float(a['atr14']); support=float(a['support20'])
+    active=a['active_strategies']
+    # Conservative setup: forward entry trigger above reference close, NOT a current executable quote.
+    entry=round(price+0.1*atr,3)
+    stop=round(min(support-0.15*atr, entry-1.5*atr),3)
+    risk=entry-stop
+    rr=2.0
+    target=round(entry+rr*risk,3)
+    second=round(entry+3*risk,3)
+    # 15-bar historical outcome backtests are *not* predictive win probabilities.
+    tested={k:v for k,v in a['backtests'].items() if k in active}
+    enough=any(v['samples']>=20 and v['mean_return_pct'] is not None and v['mean_return_pct']>0 for v in tested.values())
+    liquid=a['avg_turnover_m_sar']>=20
+    strong=bool(active) and enough and liquid and a['quality_score_100']>=75 and stop>0 and risk>0
+    shares=min(int(MAX_ENTRY_SAR//entry),int(RISK_PER_TRADE_SAR//risk)) if risk>0 else 0
+    strong = strong and shares>0
+    return {
+        'السهم':ticker,'التاريخ':a['date'],'الإغلاق_المرجعي':price,
+        'الدعم':support,'المقاومة':a['resistance60'],
+        'بداية_نطاق_الشراء':entry,'نهاية_نطاق_الشراء':entry,
+        'وقف_تقديري':stop,'هدف_تقديري':target,'هدف_ثان':second,
+        'قيمة_التداول_اليومية_المتوسطة_مليون':a['avg_turnover_m_sar'],
+        'الحجم_النسبي':a['relative_volume'],'RSI14':a['rsi14'],
+        'EMA20':None,'EMA50':None,'نسبة_العائد_للمخاطرة':rr,
+        'كمية_افتراضية':shares,'إجمالي_الشراء_ريال':round(shares*entry,2),
+        'الحالة':'فرصة مشروطة' if strong else 'لا دخول',
+        'درجة_الجودة':a['quality_score_100'],'الاستراتيجيات':','.join(active),
+        'اختبارات_تاريخية':{k:{q:v[q] for q in ('samples','win_rate_pct','mean_return_pct')}
+                            for k,v in tested.items()},
+        'السبب_عند_الرفض':'لا يوجد تأكيد كافٍ أو أقل من 20 حالة إيجابية في الاختبار التاريخي' if not strong else ''
     }
-    status='فرصة مشروطة' if all(conditions.values()) else ('مراقبة دعم' if liquid and touched and valid_range else 'لا دخول')
-    reason='، '.join(k for k,v in conditions.items() if not v)
-    return dict(السهم=ticker,التاريخ=str(d.index[-1].date()),الإغلاق_المرجعي=round(price,3),الدعم=round(support,3),المقاومة=round(resistance,3),
-       بداية_نطاق_الشراء=round(lower,3) if valid_range else None,نهاية_نطاق_الشراء=round(upper,3) if valid_range else None,
-       وقف_تقديري=round(stop,3) if valid_range else None,هدف_تقديري=round(potential_target,3),
-       قيمة_التداول_اليومية_المتوسطة_مليون=round(avgvalue/1e6,1),الحجم_النسبي=round(relvol,2),RSI14=round(rsi,1),
-       EMA20=round(ema20,3),EMA50=round(ema50,3),نسبة_العائد_للمخاطرة=round(rr,2),كمية_افتراضية=shares,
-       إجمالي_الشراء_ريال=round(shares*entry,2) if shares else 0,الحالة=status,السبب_عند_الرفض=reason or 'شروط تاريخية متحققة؛ التأكيد اللحظي مطلوب')
-

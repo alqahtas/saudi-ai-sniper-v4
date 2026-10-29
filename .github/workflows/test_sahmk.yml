@@ -14,7 +14,9 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-
+          
+      - name: Install requests
+        run: python -m pip install requests
       - name: Test SAHMK quote for SABIC
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}

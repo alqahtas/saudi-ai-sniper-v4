@@ -1,0 +1,37 @@
+name: Test SAHMK API
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Test SAHMK quote for SABIC
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, requests
+          key = os.environ.get('SAHMK_API_KEY', '')
+          if not key:
+              raise SystemExit('SAHMK_API_KEY missing')
+          url = 'https://api.sahmk.sa/api/v1/quote/2010/'
+          response = requests.get(url, headers={'X-API-Key': key}, timeout=20)
+          print('HTTP status:', response.status_code)
+          response.raise_for_status()
+          data = response.json()
+          for field in ('symbol', 'name', 'price', 'volume', 'updated_at', 'is_delayed'):
+              print(f'{field}: {data.get(field)}')
+          if data.get('price') is None:
+              raise SystemExit('No price returned')
+          print('SAHMK CONNECTION SUCCESS')
+          PY

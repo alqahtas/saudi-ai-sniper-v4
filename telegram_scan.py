@@ -1,56 +1,100 @@
-"""One Telegram sender; only new validated setups, once after market close.
-This script NEVER places orders. Daily prices are delayed/historical.
-"""
+
+"""AI Sniper V5 - Telegram alerts for validated TASI setups."""
+
 import os
-from datetime import datetime, date
+from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import requests
-from sniper_core import WATCHLIST, daily, calculate
+from market_scanner import run
 
 
-def send(token,chat,message):
-    r=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',json={'chat_id':chat,'text':message},timeout=20)
-    r.raise_for_status()
-    if not r.json().get('ok'): raise RuntimeError('Telegram rejected message')
+def strategy_label(names):
+    names = set((names or "").split(","))
+
+    if "crash_hunter" in names:
+        return "🎯 CRASH HUNTER | صائد الهبوط"
+    if "breakout" in names:
+        return "⚡ مضاربة سريعة | اختراق"
+    if "support_rebound" in names:
+        return "⚡ مضاربة سريعة | ارتداد دعم"
+
+    return "📊 إشارة فنية"
+
+
+def send_telegram(token, chat_id, message):
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": chat_id, "text": message},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError("Telegram rejected message")
 
 
 def main():
-    token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
-    chat=os.getenv('TELEGRAM_CHAT_ID','').strip()
-    if not token or not chat: raise RuntimeError('Telegram secrets missing')
-    now=datetime.now(ZoneInfo('Asia/Riyadh'))
-    # Runs after close; don't send results based on a prior trading day's candles.
-    today=now.date().isoformat()
-    results=[]; failed=[]
-    for ticker in WATCHLIST:
-        try:
-            d=daily(ticker)
-            if d is None:
-                failed.append(ticker);continue
-            val=calculate(ticker,d)
-            if val:results.append(val)
-            else:failed.append(ticker)
-        except Exception:
-            failed.append(ticker)
-    if not results: raise RuntimeError('No usable stock data; aborted without notification')
-    latest=max(x['التاريخ'] for x in results)
-    if latest != today:
-        print(f'No notification: latest candle {latest}, today {today}.')
-        return
-    # No forced recommendations: only validated strategy and backtest sample.
-    opportunities=sorted((r for r in results if r['الحالة']=='فرصة مشروطة' and r['التاريخ']==today),
-                         key=lambda r:r['درجة_الجودة'],reverse=True)[:5]
-    if not opportunities:
-        print(f'No validated opportunities for {today}; no Telegram notification.')
-        return
-    lines=[f'🇸🇦 AI Sniper V5 — {today}', '⚠️ إشارات مشروطة مبنية على إغلاق يومي، ليست أسعارًا لحظية.']
-    for r in opportunities:
-        lines.append(f"\n📈 {r['السهم']} | تقييم {r['درجة_الجودة']}/100\n"
-                     f"دخول بعد التأكيد: {r['بداية_نطاق_الشراء']} ر.س\n"
-                     f"وقف: {r['وقف_تقديري']} | هدف 1: {r['هدف_تقديري']} | هدف 2: {r['هدف_ثان']}\n"
-                     f"الاستراتيجية: {r['الاستراتيجيات']} | عائد/مخاطرة: {r['نسبة_العائد_للمخاطرة']}")
-    lines.append('\nراجع السعر المباشر وسيولة الجلسة قبل التنفيذ. لا يوجد ضمان للربح.')
-    send(token,chat,'\n'.join(lines))
-    print(f'Sent {len(opportunities)} qualified setups')
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-if __name__=='__main__':main()
+    if not token or not chat_id:
+        raise RuntimeError("Telegram secrets missing")
+
+    report = run(max_candidates=50, quote_budget=0)
+
+    today = datetime.now(
+        ZoneInfo("Asia/Riyadh")
+    ).date().isoformat()
+
+    candidates = report["historical_candidates"]
+
+    qualified = [
+        item for item in candidates
+        if item.get("تصنيف_الماسح") == "فرصة مشروطة"
+        and item.get("التاريخ") == today
+    ]
+
+    qualified = qualified[:5]
+
+    print("Market:", report["universe_size"])
+    print("Watchlist:", len(candidates))
+    print("Qualified today:", len(qualified))
+
+    if not qualified:
+        print("No validated setups. No Telegram alert.")
+        return
+
+    for item in qualified:
+        label = strategy_label(
+            item.get("الاستراتيجيات")
+        )
+
+        message = (
+            f"{label}\n\n"
+            f"🇸🇦 AI SNIPER V5\n"
+            f"السهم: {item['اسم_الشركة']}\n"
+            f"الرمز: {item['السهم']}\n"
+            f"التقييم الفني: {item['درجة_الجودة']}/100\n\n"
+            f"🟢 دخول مشروط: "
+            f"{item['بداية_نطاق_الشراء']} ريال\n"
+            f"🔴 وقف تقديري: "
+            f"{item['وقف_تقديري']} ريال\n"
+            f"🎯 الهدف الأول: "
+            f"{item['هدف_تقديري']} ريال\n"
+            f"🎯 الهدف الثاني: "
+            f"{item['هدف_ثان']} ريال\n\n"
+            f"تاريخ الشمعة: {item['التاريخ']}\n"
+            f"الحالة: فرصة مشروطة\n\n"
+            f"⚠️ بيانات يومية تاريخية وليست لحظية.\n"
+            f"راجع السعر والسيولة قبل أي أمر شراء."
+        )
+
+        send_telegram(token, chat_id, message)
+
+    print("Telegram messages sent:", len(qualified))
+
+
+if __name__ == "__main__":
+    main()

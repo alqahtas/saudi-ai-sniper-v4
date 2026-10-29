@@ -1,0 +1,40 @@
+
+name: Test Market Scanner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-market:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests yfinance pandas numpy
+
+      - name: Test SAHMK market directory
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: |
+          python - <<'PY'
+          from market_scanner import tasi_equities, rank_universe
+
+          symbols = tasi_equities()
+          print("TASI stocks found:", len(symbols))
+          print("First 5 symbols:", list(symbols)[:5])
+
+          sample = dict(list(symbols.items())[:5])
+          ranked, errors = rank_universe(sample, max_candidates=5)
+          print("Candidates:", len(ranked))
+          print("Historical failures:", errors)
+          print("MARKET SCANNER TEST COMPLETED")
+          PY

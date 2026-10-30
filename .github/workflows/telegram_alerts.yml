@@ -1,4 +1,3 @@
-
 name: Saudi AI Sniper - Telegram Alerts
 
 on:
@@ -34,7 +33,31 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests yfinance pandas numpy
+          pip install -r requirements.txt
+
+      - name: Test Telegram connection
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          response = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={
+                  "chat_id": chat_id,
+                  "text": "✅ Saudi AI Sniper V5 - Telegram connection successful"
+              },
+              timeout=30,
+          )
+          response.raise_for_status()
+          if not response.json().get("ok"):
+              raise RuntimeError("Telegram rejected test message")
+
+          print("Telegram connection successful")
+          PY
 
       - name: Scan TASI and send qualified alerts
         run: |

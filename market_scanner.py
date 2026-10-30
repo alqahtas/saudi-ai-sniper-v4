@@ -1,12 +1,10 @@
-"""Saudi AI Sniper V5 - TASI daily scanner + confirmed weekly swing setups.
+"""Saudi AI Sniper V5.1 — historical TASI daily and weekly scanner.
 
-Uses historical candle data; NOT a real-time trading signal or order system.
-Weekly strategies use completed weekly candles only.
+Read-only scanner. Does not place orders or represent historical candles as live.
 """
-
 import json
+import logging
 import os
-import warnings
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,10 +12,26 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-warnings.filterwarnings("ignore", message=r"The inplace keyword .* is deprecated", module=r"yfinance\..*")
 BASE_URL = "https://api.sahmk.sa/api/v1"
-MIN_LIQUIDITY_M_SAR = 20.0
 TZ = ZoneInfo("Asia/Riyadh")
+MIN_LIQUIDITY_M_SAR = 20.0
+LOG = logging.getLogger(__name__)
+
+
+def fix_text(value):
+    """Repair UTF-8 Arabic accidentally decoded as Latin-1, when possible."""
+    if not isinstance(value, str) or not any(x in value for x in ("Ø", "Ù")):
+        return value
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return value
+
+
+def normalize_row(row):
+    if not isinstance(row, dict):
+        return row
+    return {fix_text(k): fix_text(v) for k, v in row.items()}
 
 
 def sahmk_session():
@@ -41,9 +55,9 @@ def tasi_equities(session=None):
         )
         response.raise_for_status()
         payload = response.json()
-        rows = payload.get("results")
+        rows = payload.get("results") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
-            raise RuntimeError("Invalid SAHMK response")
+            raise RuntimeError("Invalid SAHMK companies response")
         for company in rows:
             if not isinstance(company, dict):
                 continue
@@ -51,26 +65,27 @@ def tasi_equities(session=None):
             if (company.get("market") == "TASI"
                     and str(company.get("status", "")).lower() == "active"
                     and str(company.get("security_type", "")).lower() == "equity"
-                    and company.get("is_etf") is not True and symbol.isdigit()):
+                    and company.get("is_etf") is not True
+                    and symbol.isdigit()):
                 symbols[symbol] = company.get("name_ar") or company.get("name_en") or symbol
         offset += len(rows)
         total = payload.get("total")
         if not rows or (isinstance(total, int) and offset >= total) or len(rows) < 500:
             break
     else:
-        raise RuntimeError("Too many directory pages")
+        raise RuntimeError("Companies directory exceeded 10 pages")
     if not symbols:
-        raise RuntimeError("No TASI stocks found")
+        raise RuntimeError("No active TASI equities found in SAHMK response")
     return symbols
 
 
 def normalized_daily(candles):
-    """Prepare daily OHLCV for weekly aggregation; returns None for unknown formats."""
     import pandas as pd
     if candles is None or candles.empty:
         return None
     df = candles.copy()
-    # Support index-based dates and the common Date/Datetime column layout.
+    if isinstance(df.columns, pd.MultiIndex):
+        return None
     if not isinstance(df.index, pd.DatetimeIndex):
         date_col = next((c for c in df.columns if str(c).lower() in ("date", "datetime", "timestamp")), None)
         if date_col is None:
@@ -78,13 +93,11 @@ def normalized_daily(candles):
         df.index = pd.to_datetime(df[date_col], errors="coerce", utc=True).dt.tz_localize(None)
     elif df.index.tz is not None:
         df.index = df.index.tz_localize(None)
-    if isinstance(df.columns, pd.MultiIndex):
-        return None  # avoid silently mixing symbols/columns
     names = {str(c).lower(): c for c in df.columns}
     required = ("open", "high", "low", "close", "volume")
-    if not all(k in names for k in required):
+    if not all(name in names for name in required):
         return None
-    df = df[[names[k] for k in required]].copy()
+    df = df[[names[name] for name in required]].copy()
     df.columns = list(required)
     for name in required:
         df[name] = pd.to_numeric(df[name], errors="coerce")
@@ -94,12 +107,6 @@ def normalized_daily(candles):
 
 
 def weekly_setup(symbol, company, daily_candles, liquidity):
-    """Conservative weekly watch strategy on fully completed Saudi trading weeks.
-
-    A signal requires: weekly upward trend, RSI strength, a close near a recent
-    support zone, and above-average weekly volume. This is a *technical setup*,
-    not confirmed live execution or a fundamental valuation.
-    """
     import pandas as pd
     df = normalized_daily(daily_candles)
     if df is None or len(df) < 160 or liquidity < MIN_LIQUIDITY_M_SAR:
@@ -107,7 +114,6 @@ def weekly_setup(symbol, company, daily_candles, liquidity):
     weekly = df.resample("W-THU", label="right", closed="right").agg({
         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
     }).dropna()
-    # Do not use a partially formed weekly bar (Saudi week ends Thursday).
     now = datetime.now(TZ)
     today = pd.Timestamp(now.date())
     weekly = weekly.loc[weekly.index <= today]
@@ -116,14 +122,12 @@ def weekly_setup(symbol, company, daily_candles, liquidity):
     if len(weekly) < 30:
         return None
     close, volume = weekly["close"], weekly["volume"]
-    ma10 = close.rolling(10).mean()
-    ma20 = close.rolling(20).mean()
+    ma10, ma20 = close.rolling(10).mean(), close.rolling(20).mean()
     vol10 = volume.shift(1).rolling(10).mean()
     delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    rsi = 100 - 100 / (1 + rs)
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi = 100 - 100 / (1 + gain / loss.replace(0, float("nan")))
     support = weekly["low"].shift(1).rolling(12).min()
     latest = weekly.iloc[-1]
     price, base = float(latest["close"]), float(support.iloc[-1])
@@ -143,19 +147,18 @@ def weekly_setup(symbol, company, daily_candles, liquidity):
     if risk <= 0:
         return None
     return {
-        "Ø§ÙØ³ÙÙ": symbol, "Ø§Ø³Ù_Ø§ÙØ´Ø±ÙØ©": company,
-        "Ø§ÙØ¥Ø·Ø§Ø±_Ø§ÙØ²ÙÙÙ": "weekly", "Ø§ÙØ§Ø³ØªØ±Ø§ØªÙØ¬ÙØ§Øª": "weekly_support",
-        "Ø§ÙØ­Ø§ÙØ©": "ÙØ±ØµØ© ÙØ´Ø±ÙØ·Ø©", "ØªØµÙÙÙ_Ø§ÙÙØ§Ø³Ø­": "ÙØ±ØµØ© ÙØ´Ø±ÙØ·Ø©",
-        "Ø¯Ø±Ø¬Ø©_Ø§ÙØ¬ÙØ¯Ø©": 80,
-        "Ø¨Ø¯Ø§ÙØ©_ÙØ·Ø§Ù_Ø§ÙØ´Ø±Ø§Ø¡": round(price, 2),
-        "ÙÙÙ_ØªÙØ¯ÙØ±Ù": stop,
-        "ÙØ¯Ù_ØªÙØ¯ÙØ±Ù": round(price + 1.5 * risk, 2),
-        "ÙØ¯Ù_Ø«Ø§Ù": round(price + 2.5 * risk, 2),
-        "Ø§ÙØªØ§Ø±ÙØ®": weekly.index[-1].date().isoformat(),
-        "ÙÙÙØ©_Ø§ÙØªØ¯Ø§ÙÙ_Ø§ÙÙÙÙÙØ©_Ø§ÙÙØªÙØ³Ø·Ø©_ÙÙÙÙÙ": liquidity,
-        "ÙØ³ØªÙÙÙ_Ø´Ø±Ø·_Ø§ÙØ³ÙÙÙØ©": True,
-        "Ø³Ø¨Ø¨_Ø§ÙØ¥Ø´Ø§Ø±Ø©": "Ø§ØªØ¬Ø§Ù Ø£Ø³Ø¨ÙØ¹Ù ØµØ§Ø¹Ø¯ + RSI + ÙØ±Ø¨ Ø¯Ø¹Ù + Ø­Ø¬Ù Ø£Ø³Ø¨ÙØ¹Ù ÙØ±ØªÙØ¹",
-        "ÙÙØ¹_Ø§ÙØ¨ÙØ§ÙØ§Øª": "Ø´ÙÙØ¹ Ø£Ø³Ø¨ÙØ¹ÙØ© ÙÙØªÙÙØ© - ÙÙØ³Øª Ø£Ø³Ø¹Ø§Ø±ÙØ§ ÙØ­Ø¸ÙØ©",
+        "السهم": symbol, "اسم_الشركة": company,
+        "الإطار_الزمني": "weekly", "الاستراتيجيات": "weekly_support",
+        "الحالة": "فرصة مشروطة", "تصنيف_الماسح": "فرصة مشروطة",
+        "درجة_الجودة": 80,
+        "بداية_نطاق_الشراء": round(price, 2), "وقف_تقديري": stop,
+        "هدف_تقديري": round(price + 1.5 * risk, 2),
+        "هدف_ثان": round(price + 2.5 * risk, 2),
+        "التاريخ": weekly.index[-1].date().isoformat(),
+        "قيمة_التداول_اليومية_المتوسطة_مليون": liquidity,
+        "مستوفي_شرط_السيولة": True,
+        "سبب_الإشارة": "اتجاه أسبوعي صاعد + RSI + قرب دعم + حجم أسبوعي مرتفع",
+        "نوع_البيانات": "شموع أسبوعية مكتملة، ليست أسعارًا لحظية",
     }
 
 
@@ -163,6 +166,8 @@ def scan_universe(symbols, max_candidates=50):
     from sniper_core import daily, calculate
     stats = Counter()
     failures, scored, weeklies = [], [], []
+    total = len(symbols)
+    LOG.info("SCAN START: %d TASI equities", total)
     for index, (symbol, company) in enumerate(symbols.items(), 1):
         try:
             candles = daily(symbol)
@@ -176,18 +181,18 @@ def scan_universe(symbols, max_candidates=50):
                 failures.append(symbol)
                 continue
             stats["analyzed"] += 1
-            item = dict(result)
-            item["Ø§Ø³Ù_Ø§ÙØ´Ø±ÙØ©"] = company
-            score = float(item.get("Ø¯Ø±Ø¬Ø©_Ø§ÙØ¬ÙØ¯Ø©") or 0)
-            liquidity = float(item.get("ÙÙÙØ©_Ø§ÙØªØ¯Ø§ÙÙ_Ø§ÙÙÙÙÙØ©_Ø§ÙÙØªÙØ³Ø·Ø©_ÙÙÙÙÙ") or 0)
+            item = normalize_row(dict(result))
+            item["اسم_الشركة"] = company
+            score = float(item.get("درجة_الجودة") or 0)
+            liquidity = float(item.get("قيمة_التداول_اليومية_المتوسطة_مليون") or 0)
             liquid = liquidity >= MIN_LIQUIDITY_M_SAR
             stats["liquid" if liquid else "below_liquidity_threshold"] += 1
-            validated = liquid and item.get("Ø§ÙØ­Ø§ÙØ©") == "ÙØ±ØµØ© ÙØ´Ø±ÙØ·Ø©"
+            validated = liquid and item.get("الحالة") == "فرصة مشروطة"
             if validated:
                 stats["validated_setups"] += 1
-            item["ØªØµÙÙÙ_Ø§ÙÙØ§Ø³Ø­"] = "ÙØ±ØµØ© ÙØ´Ø±ÙØ·Ø©" if validated else "ÙØ±Ø§ÙØ¨Ø© ÙÙØ·"
-            item["ÙØ³ØªÙÙÙ_Ø´Ø±Ø·_Ø§ÙØ³ÙÙÙØ©"] = liquid
-            item.setdefault("Ø§ÙØ¥Ø·Ø§Ø±_Ø§ÙØ²ÙÙÙ", "daily")
+            item["تصنيف_الماسح"] = "فرصة مشروطة" if validated else "مراقبة فقط"
+            item["مستوفي_شرط_السيولة"] = liquid
+            item.setdefault("الإطار_الزمني", "daily")
             scored.append((validated, liquid, score, liquidity, item))
             try:
                 weekly = weekly_setup(symbol, company, candles, liquidity)
@@ -196,18 +201,22 @@ def scan_universe(symbols, max_candidates=50):
                     stats["weekly_setups"] += 1
             except Exception as exc:
                 stats["weekly_errors"] += 1
-                print(f"WARN weekly {symbol}: {type(exc).__name__}: {exc}", flush=True)
+                LOG.warning("Weekly analysis %s: %s: %s", symbol, type(exc).__name__, exc)
         except Exception as exc:
             stats["exceptions"] += 1
             failures.append(symbol)
-            print(f"WARN {symbol}: {type(exc).__name__}: {str(exc)[:120]}", flush=True)
-        if index % 50 == 0:
-            print(f"Progress: {index}/{len(symbols)}; analyzed={stats['analyzed']}; failed={len(failures)}", flush=True)
+            LOG.warning("Stock %s: %s: %s", symbol, type(exc).__name__, str(exc)[:150])
+        finally:
+            if index == 1 or index % 10 == 0 or index == total:
+                LOG.info("SCAN PROGRESS: %d/%d analyzed=%d failures=%d", index, total, stats["analyzed"], len(failures))
     scored.sort(key=lambda row: row[:4], reverse=True)
     top = [row[4] for row in scored[:max(0, int(max_candidates))]]
-    weeklies.sort(key=lambda x: x["Ø¯Ø±Ø¬Ø©_Ø§ÙØ¬ÙØ¯Ø©"], reverse=True)
-    stats.update(universe_size=len(symbols), failed_total=len(failures),
-                 watchlist_returned=len(top), watchlist_liquid=sum(1 for item in top if item["ÙØ³ØªÙÙÙ_Ø´Ø±Ø·_Ø§ÙØ³ÙÙÙØ©"]))
+    weeklies.sort(key=lambda item: item["درجة_الجودة"], reverse=True)
+    stats.update(
+        universe_size=total, failed_total=len(failures),
+        watchlist_returned=len(top),
+        watchlist_liquid=sum(bool(item["مستوفي_شرط_السيولة"]) for item in top),
+    )
     return top, weeklies, failures, dict(stats)
 
 
@@ -223,11 +232,11 @@ def verify_quotes(candidates, session=None, budget=0):
     session = session or sahmk_session()
     quotes = {}
     for item in candidates[:budget]:
-        symbol = str(item["Ø§ÙØ³ÙÙ"])
+        symbol = str(item["السهم"])
         try:
             response = session.get(f"{BASE_URL}/quote/{symbol}/", timeout=20)
             if response.status_code in (401, 403, 429):
-                print(f"SAHMK HTTP {response.status_code}")
+                LOG.warning("SAHMK quote HTTP %s", response.status_code)
                 break
             response.raise_for_status()
             payload = response.json()
@@ -235,35 +244,45 @@ def verify_quotes(candidates, session=None, budget=0):
                 continue
             quotes[symbol] = {key: payload.get(key) for key in ("price", "volume", "updated_at", "is_delayed")}
         except requests.RequestException as exc:
-            print(f"WARN quote {symbol}: {type(exc).__name__}")
+            LOG.warning("Quote %s: %s", symbol, type(exc).__name__)
     return quotes
 
 
 def run(max_candidates=50, quote_budget=0):
+    LOG.info("Historical scanner requested")
     symbols = tasi_equities()
+    LOG.info("SAHMK directory returned %d equities", len(symbols))
     ranked, weeklies, failed, stats = scan_universe(symbols, max_candidates)
     quotes = verify_quotes(ranked, budget=quote_budget)
-    # Compatible with telegram_scan.py, which reads historical_candidates.
-    candidates = (ranked + weeklies)
+    # Keep weekly candidates only once in historical_candidates.
+    candidates = ranked + weeklies
     report = {
         "scanned_at_utc": datetime.now(timezone.utc).isoformat(),
         "market": "TASI", "universe_size": len(symbols), "summary": stats,
         "historical_candidates": candidates, "weekly_candidates": weeklies,
         "historical_failures": failed, "sahmk_quotes": quotes,
-        "note": "Daily and completed weekly historical candles. NOT a live entry confirmation.",
+        "note": "Historical daily and completed weekly candles; no live entry confirmation.",
     }
-    Path("market_scan_result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    lines = ["SAUDI AI SNIPER - DAILY + WEEKLY HISTORICAL SCAN",
-             f"Discovered: {len(symbols)}", f"Analyzed: {stats.get('analyzed', 0)}",
-             f"Errors: {len(failed)}", f"Daily setups: {stats.get('validated_setups', 0)}",
-             f"Weekly setups: {len(weeklies)}", f"Quotes retrieved: {len(quotes)}",
-             "TOP 10 DAILY WATCHLIST:"]
+    Path("market_scan_result.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    lines = [
+        "SAUDI AI SNIPER V5.1 - HISTORICAL SCAN",
+        f"Discovered: {len(symbols)}",
+        f"Analyzed: {stats.get('analyzed', 0)}",
+        f"Errors: {len(failed)}",
+        f"Daily setups: {stats.get('validated_setups', 0)}",
+        f"Weekly setups: {len(weeklies)}",
+        f"Quotes retrieved: {len(quotes)}",
+        "TOP 10 DAILY WATCHLIST:",
+    ]
     for item in ranked[:10]:
-        lines.append(f"{item.get('Ø§ÙØ³ÙÙ')} | score={item.get('Ø¯Ø±Ø¬Ø©_Ø§ÙØ¬ÙØ¯Ø©')} | {item['ØªØµÙÙÙ_Ø§ÙÙØ§Ø³Ø­']}")
+        lines.append(f"{item.get('السهم')} | score={item.get('درجة_الجودة')} | {item.get('تصنيف_الماسح')}")
     lines.append("WEEKLY SETUPS:")
     for item in weeklies[:10]:
-        lines.append(f"{item['Ø§ÙØ³ÙÙ']} | weekly close={item['Ø¨Ø¯Ø§ÙØ©_ÙØ·Ø§Ù_Ø§ÙØ´Ø±Ø§Ø¡']}")
+        lines.append(f"{item['السهم']} | weekly close={item['بداية_نطاق_الشراء']}")
     Path("market_scan_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    LOG.info("SCAN COMPLETE: discovered=%d analyzed=%d failed=%d daily=%d weekly=%d", len(symbols), stats.get("analyzed", 0), len(failed), stats.get("validated_setups", 0), len(weeklies))
     print("\n".join(lines), flush=True)
     if stats.get("analyzed", 0) == 0:
         raise RuntimeError("No stocks were actually analyzed")
@@ -271,4 +290,5 @@ def run(max_candidates=50, quote_budget=0):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run()

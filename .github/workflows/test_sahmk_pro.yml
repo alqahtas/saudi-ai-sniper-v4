@@ -1,5 +1,4 @@
-
-name: Test SAHMK Pro
+name: Test SAHMK Pro Live WebSocket
 
 on:
   workflow_dispatch:
@@ -21,10 +20,83 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install requests
-        run: pip install requests
+      - name: Install dependencies
+        run: pip install requests websocket-client
 
-      - name: Test SAHMK Pro market data
+      - name: Test SAHMK REST
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
         run: python -u sahmk_pro.py
+
+      - name: Test SAHMK live WebSocket
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import time
+          from urllib.parse import quote
+          from websocket import create_connection, WebSocketTimeoutException
+
+          key = os.environ["SAHMK_API_KEY"].strip()
+          if not key:
+              raise RuntimeError("Missing SAHMK API key")
+
+          url = "wss://api.sahmk.sa/ws/v1/stocks/?api_key=" + quote(key, safe="")
+          ws = None
+          connected = False
+          subscribed = False
+          quotes = 0
+
+          try:
+              ws = create_connection(url, timeout=12)
+              ws.settimeout(3)
+              end = time.monotonic() + 20
+              while time.monotonic() < end:
+                  try:
+                      raw = ws.recv()
+                  except WebSocketTimeoutException:
+                      continue
+
+                  msg = json.loads(raw)
+                  kind = msg.get("type")
+                  if kind == "connected":
+                      connected = True
+                      print("LIVE CONNECTION OK")
+                      print("Plan:", msg.get("plan"))
+                      print("Limits:", json.dumps(msg.get("limits", {})))
+                      ws.send(json.dumps({
+                          "action": "subscribe",
+                          "symbols": ["2222", "1120"]
+                      }))
+                  elif kind == "subscribed":
+                      subscribed = True
+                      print("SUBSCRIPTION OK:", msg.get("symbols"))
+                  elif kind == "quote":
+                      quotes += 1
+                      data = msg.get("data") or {}
+                      print("QUOTE:", msg.get("symbol"), data.get("price"))
+                  elif kind == "error":
+                      print("STREAM ERROR:", msg.get("code", "unknown"))
+                      raise RuntimeError("WebSocket server rejected request")
+
+                  if connected and subscribed and quotes:
+                      break
+          except Exception:
+              print("WebSocket connection or subscription failed. Review access and entitlement.")
+              raise RuntimeError("WebSocket test failed") from None
+          finally:
+              if ws:
+                  ws.close()
+
+          if not connected:
+              raise RuntimeError("No WebSocket connected acknowledgement")
+          if not subscribed:
+              raise RuntimeError("No subscription acknowledgement")
+
+          print("WEBSOCKET ACCESS TEST PASSED")
+          print("Live quotes received:", quotes)
+          if not quotes:
+              print("No new quotes received; test again during market hours.")
+          PY

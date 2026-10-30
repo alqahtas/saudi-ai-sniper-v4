@@ -1,6 +1,6 @@
-"""Saudi AI Sniper V5.1 — historical TASI daily and weekly scanner.
 
-Read-only scanner. Does not place orders or represent historical candles as live.
+"""Saudi AI Sniper V5.3 — activity-filtered historical TASI scanner.
+Read-only; no orders or live-entry confirmation.
 """
 import json
 import logging
@@ -14,12 +14,12 @@ import requests
 
 BASE_URL = "https://api.sahmk.sa/api/v1"
 TZ = ZoneInfo("Asia/Riyadh")
-MIN_LIQUIDITY_M_SAR = 20.0
 LOG = logging.getLogger(__name__)
+MIN_LIQUIDITY_M_SAR = 20.0
+UNIVERSE_LIMIT = max(10, min(100, int(os.getenv("SCAN_UNIVERSE_LIMIT", "100"))))
 
 
 def fix_text(value):
-    """Repair UTF-8 Arabic accidentally decoded as Latin-1, when possible."""
     if not isinstance(value, str) or not any(x in value for x in ("Ø", "Ù")):
         return value
     try:
@@ -62,11 +62,13 @@ def tasi_equities(session=None):
             if not isinstance(company, dict):
                 continue
             symbol = str(company.get("symbol", "")).strip()
-            if (company.get("market") == "TASI"
-                    and str(company.get("status", "")).lower() == "active"
-                    and str(company.get("security_type", "")).lower() == "equity"
-                    and company.get("is_etf") is not True
-                    and symbol.isdigit()):
+            if (
+                company.get("market") == "TASI"
+                and str(company.get("status", "")).lower() == "active"
+                and str(company.get("security_type", "")).lower() == "equity"
+                and company.get("is_etf") is not True
+                and symbol.isdigit()
+            ):
                 symbols[symbol] = company.get("name_ar") or company.get("name_en") or symbol
         offset += len(rows)
         total = payload.get("total")
@@ -75,8 +77,48 @@ def tasi_equities(session=None):
     else:
         raise RuntimeError("Companies directory exceeded 10 pages")
     if not symbols:
-        raise RuntimeError("No active TASI equities found in SAHMK response")
+        raise RuntimeError("No active TASI equities found")
     return symbols
+
+
+def select_active_equities(symbols, session=None, limit=UNIVERSE_LIMIT):
+    """Select liquid/activity leaders, not a historical top-100 ranking.
+
+    SAHMK leader endpoints each allow up to 50 names. Combine value leaders
+    with volume leaders; avoid silently substituting arbitrary directory order.
+    """
+    session = session or sahmk_session()
+    selected = {}
+    for endpoint in ("value", "volume"):
+        try:
+            response = session.get(
+                f"{BASE_URL}/market/{endpoint}/",
+                params={"index": "TASI", "limit": 50},
+                timeout=25,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("stocks") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise ValueError("Invalid market leaders response")
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("symbol", "")).strip()
+                if symbol in symbols:
+                    selected[symbol] = symbols[symbol]
+                if len(selected) >= limit:
+                    break
+            LOG.info("ACTIVITY %s: received=%d selected=%d", endpoint, len(rows), len(selected))
+        except (requests.RequestException, ValueError) as exc:
+            LOG.warning("ACTIVITY %s unavailable: %s", endpoint, exc)
+        if len(selected) >= limit:
+            break
+    if not selected:
+        raise RuntimeError("No verified activity leaders available; refusing arbitrary stock selection")
+    if len(selected) < limit:
+        LOG.warning("Only %d unique active symbols found (target=%d)", len(selected), limit)
+    return dict(list(selected.items())[:limit])
 
 
 def normalized_daily(candles):
@@ -142,7 +184,7 @@ def weekly_setup(symbol, company, daily_candles, liquidity):
     )
     if not all(conditions):
         return None
-    stop = round(base * 0.98, 2)
+    stop = round(base * .98, 2)
     risk = price - stop
     if risk <= 0:
         return None
@@ -150,9 +192,8 @@ def weekly_setup(symbol, company, daily_candles, liquidity):
         "السهم": symbol, "اسم_الشركة": company,
         "الإطار_الزمني": "weekly", "الاستراتيجيات": "weekly_support",
         "الحالة": "فرصة مشروطة", "تصنيف_الماسح": "فرصة مشروطة",
-        "درجة_الجودة": 80,
-        "بداية_نطاق_الشراء": round(price, 2), "وقف_تقديري": stop,
-        "هدف_تقديري": round(price + 1.5 * risk, 2),
+        "درجة_الجودة": 80, "بداية_نطاق_الشراء": round(price, 2),
+        "وقف_تقديري": stop, "هدف_تقديري": round(price + 1.5 * risk, 2),
         "هدف_ثان": round(price + 2.5 * risk, 2),
         "التاريخ": weekly.index[-1].date().isoformat(),
         "قيمة_التداول_اليومية_المتوسطة_مليون": liquidity,
@@ -167,7 +208,7 @@ def scan_universe(symbols, max_candidates=50):
     stats = Counter()
     failures, scored, weeklies = [], [], []
     total = len(symbols)
-    LOG.info("SCAN START: %d TASI equities", total)
+    LOG.info("SCAN START: %d selected TASI equities", total)
     for index, (symbol, company) in enumerate(symbols.items(), 1):
         try:
             candles = daily(symbol)
@@ -250,30 +291,33 @@ def verify_quotes(candidates, session=None, budget=0):
 
 def run(max_candidates=50, quote_budget=0):
     LOG.info("Historical scanner requested")
-    symbols = tasi_equities()
-    LOG.info("SAHMK directory returned %d equities", len(symbols))
+    session = sahmk_session()
+    all_symbols = tasi_equities(session)
+    symbols = select_active_equities(all_symbols, session, UNIVERSE_LIMIT)
+    LOG.info("SAHMK directory=%d selected=%d", len(all_symbols), len(symbols))
     ranked, weeklies, failed, stats = scan_universe(symbols, max_candidates)
-    quotes = verify_quotes(ranked, budget=quote_budget)
-    # Keep weekly candidates only once in historical_candidates.
-    candidates = ranked + weeklies
+    quotes = verify_quotes(ranked, session, budget=quote_budget)
     report = {
         "scanned_at_utc": datetime.now(timezone.utc).isoformat(),
-        "market": "TASI", "universe_size": len(symbols), "summary": stats,
-        "historical_candidates": candidates, "weekly_candidates": weeklies,
-        "historical_failures": failed, "sahmk_quotes": quotes,
+        "market": "TASI", "universe_size": len(symbols),
+        "directory_size": len(all_symbols),
+        "selection_method": "current trading-value leaders + trading-volume leaders (not historical top 100)",
+        "summary": stats,
+        "historical_candidates": ranked + weeklies,
+        "weekly_candidates": weeklies,
+        "historical_failures": failed,
+        "sahmk_quotes": quotes,
         "note": "Historical daily and completed weekly candles; no live entry confirmation.",
     }
     Path("market_scan_result.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     lines = [
-        "SAUDI AI SNIPER V5.1 - HISTORICAL SCAN",
-        f"Discovered: {len(symbols)}",
-        f"Analyzed: {stats.get('analyzed', 0)}",
-        f"Errors: {len(failed)}",
+        "SAUDI AI SNIPER V5.3 - HISTORICAL SCAN",
+        f"Directory: {len(all_symbols)}", f"Selected: {len(symbols)}",
+        f"Analyzed: {stats.get('analyzed', 0)}", f"Errors: {len(failed)}",
         f"Daily setups: {stats.get('validated_setups', 0)}",
-        f"Weekly setups: {len(weeklies)}",
-        f"Quotes retrieved: {len(quotes)}",
+        f"Weekly setups: {len(weeklies)}", f"Quotes retrieved: {len(quotes)}",
         "TOP 10 DAILY WATCHLIST:",
     ]
     for item in ranked[:10]:
@@ -282,7 +326,9 @@ def run(max_candidates=50, quote_budget=0):
     for item in weeklies[:10]:
         lines.append(f"{item['السهم']} | weekly close={item['بداية_نطاق_الشراء']}")
     Path("market_scan_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    LOG.info("SCAN COMPLETE: discovered=%d analyzed=%d failed=%d daily=%d weekly=%d", len(symbols), stats.get("analyzed", 0), len(failed), stats.get("validated_setups", 0), len(weeklies))
+    LOG.info("SCAN COMPLETE: selected=%d analyzed=%d failed=%d daily=%d weekly=%d",
+             len(symbols), stats.get("analyzed", 0), len(failed),
+             stats.get("validated_setups", 0), len(weeklies))
     print("\n".join(lines), flush=True)
     if stats.get("analyzed", 0) == 0:
         raise RuntimeError("No stocks were actually analyzed")

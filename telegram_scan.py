@@ -1,62 +1,74 @@
-"Saudi AI Sniper V5 - TASI-aware Telegram alerts.
-Read-only. No automatic trading orders.
+"""Saudi AI Sniper V5 — TASI-aware Telegram alerts (read-only).
+
+Supports one-shot runs and an optional scheduled polling loop.
+Polling historical candles does NOT make the data real-time.
 """
 
+import json
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 from market_scanner import run
 from sahmk_pro import tasi_market
 
+TZ = ZoneInfo("Asia/Riyadh")
+STATE_FILE = Path(os.getenv("ALERT_STATE_FILE", "alert_state.json"))
+INTERVAL = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "300")))
+CONTINUOUS = os.getenv("RUN_CONTINUOUS", "false").lower() == "true"
 
-def strategy_label(names):
-    names = set((names or "").split(","))
 
+def strategy_label(raw):
+    names = set(str(raw or "").lower().split(","))
+    names = {name.strip() for name in names}
     if "crash_hunter" in names:
         return "🎯 CRASH HUNTER | صائد الهبوط"
     if "breakout" in names:
-        return "⚡ مضاربة سريعة | اختراق"
+        return "⚡ مضاربة | اختراق"
     if "support_rebound" in names:
-        return "⚡ مضاربة سريعة | ارتداد دعم"
+        return "⚡ مضاربة | ارتداد دعم"
+    if names.intersection({"weekly", "swing", "investment", "weekly_support"}):
+        return "📈 فرصة أسبوعية | متوسط المدى"
     return "📊 إشارة فنية"
 
 
+def is_weekly(item):
+    strategies = {
+        part.strip().lower()
+        for part in str(item.get("الاستراتيجيات") or "").split(",")
+    }
+    return bool(
+        strategies.intersection(
+            {"weekly", "swing", "investment", "weekly_support"}
+        )
+    ) or str(item.get("الإطار_الزمني", "")).lower() in {
+        "1w", "weekly", "أسبوعي"
+    }
+
+
 def market_status():
-    """Read TASI data and classify market risk."""
     data = tasi_market()
-
-    value = data.get("index_value")
-    change = data.get("index_change_percent")
-    advancing = data.get("advancing")
-    declining = data.get("declining")
-
-    if any(x is None for x in
-           (value, change, advancing, declining)):
-        raise RuntimeError("Incomplete TASI data")
-
-    change = float(change)
-    advancing = int(advancing)
-    declining = int(declining)
-
+    required = ("index_value", "index_change_percent", "advancing", "declining")
+    if any(data.get(k) is None for k in required):
+        raise RuntimeError("Incomplete TASI data — stop, no signals sent")
+    change = float(data["index_change_percent"])
+    advancing = int(data["advancing"])
+    declining = int(data["declining"])
     if advancing + declining == 0:
-        raise RuntimeError("No market breadth data")
-
+        raise RuntimeError("No TASI breadth data — stop, no signals sent")
     if change > 0 and advancing > declining * 1.4:
-        status = "positive"
-        label = "🟢 إيجابي"
+        status, label = "positive", "🟢 إيجابي"
     elif change < 0 and declining > advancing * 1.4:
-        status = "negative"
-        label = "🔴 سلبي"
+        status, label = "negative", "🔴 سلبي"
     else:
-        status = "mixed"
-        label = "🟡 متذبذب"
-
+        status, label = "mixed", "🟡 متذبذب"
     return {
         "status": status,
         "label": label,
-        "index": value,
+        "index": data["index_value"],
         "change": change,
         "advancing": advancing,
         "declining": declining,
@@ -76,105 +88,124 @@ def send_telegram(token, chat_id, message):
         raise RuntimeError("Telegram rejected message")
 
 
-def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+def load_sent():
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
-    if not token or not chat_id:
-        raise RuntimeError("Telegram secrets missing")
 
-    now = datetime.now(ZoneInfo("Asia/Riyadh"))
-    today = now.date().isoformat()
+def save_sent(sent):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = STATE_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(sent, ensure_ascii=False), encoding="utf-8")
+    temp.replace(STATE_FILE)
 
-    market = market_status()
 
-    print("TASI:", market["index"])
-    print("TASI change:", market["change"])
-    print("TASI status:", market["label"])
-    print("Advancing:", market["advancing"])
-    print("Declining:", market["declining"])
+def parsed_date(value):
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except (ValueError, TypeError):
+        return None
 
-    report = run(max_candidates=50, quote_budget=0)
 
-    candidates = report["historical_candidates"]
-
-    qualified = [
-        item for item in candidates
-        if item.get("تصنيف_الماسح") == "فرصة مشروطة"
-        and item.get("التاريخ") == today
-    ]
-
-    approved = []
-
-    for item in qualified:
-        strategies = set(
-            (item.get("الاستراتيجيات") or "").split(",")
-        )
-
-        if market["status"] == "positive":
-            approved.append(item)
-
-        elif market["status"] == "mixed":
-            print(
-                "Watch only - mixed market:",
-                item["السهم"]
-            )
-
-        elif "crash_hunter" in strategies:
-            print(
-                "Watch only - bearish market:",
-                item["السهم"]
-            )
-
-        else:
-            print(
-                "Filtered by bearish TASI:",
-                item["السهم"]
-            )
-
-    approved = approved[:5]
-
-    print("Qualified before market filter:", len(qualified))
-    print("Approved after market filter:", len(approved))
-
-    if not approved:
-        print("No approved entry setups. No Telegram alert.")
-        return
-
-    lines = [
-        f"🇸🇦 AI SNIPER V5 | {today}",
-        f"حالة تاسي: {market['label']}",
-        f"المؤشر: {market['index']}",
-        f"التغير: {market['change']:+.2f}%",
-        f"صاعدة: {market['advancing']} | "
-        f"هابطة: {market['declining']}",
-    ]
-
-    for item in approved:
-        lines.append(
-            "\n"
-            f"{strategy_label(item.get('الاستراتيجيات'))}\n"
-            f"السهم: {item['اسم_الشركة']} "
-            f"({item['السهم']})\n"
-            f"التقييم الفني: {item['درجة_الجودة']}/100\n"
-            f"🟢 دخول مشروط: "
-            f"{item['بداية_نطاق_الشراء']} ريال\n"
-            f"🔴 وقف تقديري: "
-            f"{item['وقف_تقديري']} ريال\n"
-            f"🎯 الهدف الأول: "
-            f"{item['هدف_تقديري']} ريال\n"
-            f"🎯 الهدف الثاني: "
-            f"{item['هدف_ثان']} ريال\n"
-            f"تاريخ الشمعة: {item['التاريخ']}"
-        )
-
-    lines.append(
-        "\n⚠️ الإشارات من شموع يومية تاريخية. "
-        "راجع السعر المباشر والسيولة قبل التنفيذ."
+def session_open(now):
+    return (
+        now.weekday() in (6, 0, 1, 2, 3)
+        and (10, 0) <= (now.hour, now.minute) < (15, 0)
     )
 
-    send_telegram(token, chat_id, "\n\n".join(lines))
-    print("Telegram report sent:", len(approved))
+
+def scan_once():
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+
+    now = datetime.now(TZ)
+    market = market_status()
+    report = run(max_candidates=50, quote_budget=0)
+    candidates = report.get("historical_candidates", [])
+    if not isinstance(candidates, list):
+        raise RuntimeError("Unexpected scanner output")
+
+    sent = load_sent()
+    threshold = (now.date() - timedelta(days=45)).isoformat()
+    sent = {key: val for key, val in sent.items() if str(val) >= threshold}
+    sent_count = 0
+
+    for item in candidates:
+        if item.get("تصنيف_الماسح") != "فرصة مشروطة":
+            continue
+
+        candle_date = parsed_date(item.get("التاريخ"))
+        weekly = is_weekly(item)
+        if candle_date is None:
+            continue
+
+        age = (now.date() - candle_date).days
+        if age < 0 or age > (7 if weekly else 0):
+            continue
+
+        if market["status"] != "positive":
+            print(
+                "Watch only (TASI risk):",
+                item.get("السهم"),
+                market["label"],
+            )
+            continue
+
+        symbol = str(item.get("السهم") or "").strip()
+        if not symbol:
+            continue
+
+        strategies = str(item.get("الاستراتيجيات") or "")
+        key = f"{symbol}|{strategies}|{candle_date.isoformat()}"
+        if key in sent:
+            continue
+
+        message = (
+            f"🇸🇦 Saudi AI Sniper V5\n"
+            f"{strategy_label(strategies)}\n"
+            f"السهم: {item.get('اسم_الشركة', symbol)} ({symbol})\n"
+            f"تاسي: {market['label']} | {market['change']:+.2f}%\n"
+            f"التقييم الفني: {item.get('درجة_الجودة', 'غير متاح')}/100\n"
+            f"منطقة شراء مشروطة: {item.get('بداية_نطاق_الشراء', 'غير متاح')} ريال\n"
+            f"وقف تقديري: {item.get('وقف_تقديري', 'غير متاح')} ريال\n"
+            f"هدف أول: {item.get('هدف_تقديري', 'غير متاح')} ريال\n"
+            f"هدف ثانٍ: {item.get('هدف_ثان', 'غير متاح')} ريال\n"
+            f"تاريخ الشمعة: {candle_date.isoformat()}\n"
+            f"الإطار: {'أسبوعي' if weekly else 'يومي'}\n\n"
+            "⚠️ تنبيه مبني على شموع تاريخية، وليس تأكيدًا لحظيًا للدخول. "
+            "تحقق من السعر والسيولة والسبريد مباشرة قبل أي قرار. "
+            "لا توجد أوامر شراء أو بيع آلية."
+        )
+        send_telegram(token, chat_id, message)
+        sent[key] = now.date().isoformat()
+        save_sent(sent)
+        sent_count += 1
+
+        if sent_count >= 5:
+            break
+
+    print(f"Scan completed {now.isoformat()}, alerts: {sent_count}")
+
+
+def main():
+    if not CONTINUOUS:
+        scan_once()
+        return
+
+    print(f"Continuous mode enabled; polling every {INTERVAL} seconds")
+    while True:
+        now = datetime.now(TZ)
+        if session_open(now):
+            try:
+                scan_once()
+            except Exception as exc:
+                print(f"Scan failed: {type(exc).__name__}: {exc}", flush=True)
+        time.sleep(INTERVAL)
 
 
 if __name__ == "__main__":

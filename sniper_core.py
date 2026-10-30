@@ -1,7 +1,7 @@
-"""Saudi AI Sniper V5 daily analysis bridge.
+"""Saudi AI Sniper V5.1 — historical daily analysis bridge.
 
-Historical candles only; no live quote, no automated trading.
-Weekly scans are handled separately in market_scanner.weekly_setup().
+Read-only. No live prices or broker orders. Weekly analysis lives in
+market_scanner.weekly_setup().
 """
 import math
 from sniper_v5 import analyze, download_daily
@@ -12,7 +12,7 @@ WATCHLIST = ('2222 1120 1180 1150 1010 1050 2010 2020 1211 7010 '
 CAPITAL_SAR = 50_000
 MAX_ENTRY_SAR = 10_000
 RISK_PER_TRADE_SAR = 150
-STOP_LOSS_PCT = .015  # retained for legacy imports; ATR stop governs below
+STOP_LOSS_PCT = .015  # legacy compatibility; ATR-based stop used below
 MIN_AVG_VALUE_SAR = 20_000_000
 MIN_REL_VOLUME = 1.10
 MIN_RR = 1.5
@@ -20,10 +20,11 @@ SUPPORT_WINDOW = 30
 
 
 def daily(ticker):
-    """Download daily candles; never silently treat them as live prices."""
+    """Load historical daily candles, never mislabel them as live quotes."""
     try:
         data = download_daily(ticker, years=5)
         if data is None or len(data) < 230:
+            print(f"Daily history insufficient for {ticker}", flush=True)
             return None
         return data
     except Exception as exc:
@@ -31,26 +32,32 @@ def daily(ticker):
         return None
 
 
-def _finite_positive(value):
+def finite(value, default=None):
     try:
-        number = float(value)
-        return number if math.isfinite(number) and number > 0 else None
-    except (TypeError, ValueError):
-        return None
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def positive(value):
+    value = finite(value)
+    return value if value is not None and value > 0 else None
 
 
 def calculate(ticker, candles):
-    """Generate a conditional daily setup from *historical* analysis."""
+    """Generate a conditional daily setup using historical analysis."""
     result = analyze(ticker, candles)
-    if not isinstance(result, dict) or result.get('error'):
+    if not isinstance(result, dict) or result.get("error"):
         return None
 
-    price = _finite_positive(result.get('close'))
-    atr = _finite_positive(result.get('atr14'))
-    support = _finite_positive(result.get('support20'))
+    price = positive(result.get("close"))
+    atr = positive(result.get("atr14"))
+    support = positive(result.get("support20"))
     if price is None or atr is None or support is None:
         return None
 
+    # Keep existing entry/stop logic for backward compatibility.
     entry = round(price + 0.1 * atr, 3)
     stop = round(min(support - 0.15 * atr, entry - 1.5 * atr), 3)
     risk = entry - stop
@@ -60,42 +67,71 @@ def calculate(ticker, candles):
     rr = max(2.0, MIN_RR)
     target = round(entry + rr * risk, 3)
     second = round(entry + 3 * risk, 3)
-    active = [str(name).strip() for name in (result.get('active_strategies') or []) if str(name).strip()]
-    backtests = result.get('backtests') or {}
-    tested = {key: value for key, value in backtests.items()
-              if key in active and isinstance(value, dict)}
+    active = [str(x).strip() for x in (result.get("active_strategies") or []) if str(x).strip()]
+    backtests = result.get("backtests") or {}
+    if not isinstance(backtests, dict):
+        backtests = {}
+    tested = {key: val for key, val in backtests.items()
+              if key in active and isinstance(val, dict)}
     enough = any(
-        (value.get('samples') or 0) >= 20
-        and value.get('mean_return_pct') is not None
-        and float(value['mean_return_pct']) > 0
-        for value in tested.values()
+        (finite(val.get("samples"), 0) >= 20)
+        and (finite(val.get("mean_return_pct"), 0) > 0)
+        for val in tested.values()
     )
-    liquidity = float(result.get('avg_turnover_m_sar') or 0)
-    score = float(result.get('quality_score_100') or 0)
-    relative_volume = float(result.get('relative_volume') or 0)
-    liquid = math.isfinite(liquidity) and liquidity >= MIN_AVG_VALUE_SAR / 1_000_000
+
+    liquidity = finite(result.get("avg_turnover_m_sar"), 0)
+    score = finite(result.get("quality_score_100"), 0)
+    relative_volume = finite(result.get("relative_volume"), 0)
+    liquid = liquidity >= MIN_AVG_VALUE_SAR / 1_000_000
+    volume_ok = relative_volume >= MIN_REL_VOLUME
 
     shares_by_budget = int(MAX_ENTRY_SAR // entry)
     shares_by_risk = int(RISK_PER_TRADE_SAR // risk)
     shares = max(0, min(shares_by_budget, shares_by_risk))
-    strong = bool(active) and enough and liquid and score >= 75 and shares > 0
+    strong = bool(active) and enough and liquid and volume_ok and score >= 75 and shares > 0
+
+    reasons = []
+    if not active:
+        reasons.append("لا توجد استراتيجية نشطة")
+    if not enough:
+        reasons.append("الاختبار التاريخي غير كافٍ")
+    if not liquid:
+        reasons.append("السيولة أقل من الحد المطلوب")
+    if not volume_ok:
+        reasons.append("الحجم النسبي أقل من الحد المطلوب")
+    if score < 75:
+        reasons.append("درجة الجودة أقل من 75")
+    if shares <= 0:
+        reasons.append("المخاطرة لا تسمح بكمية شراء")
 
     return {
-        'Ø§ÙØ³ÙÙ': str(ticker), 'Ø§ÙØªØ§Ø±ÙØ®': result.get('date'),
-        'Ø§ÙØ¥Ø·Ø§Ø±_Ø§ÙØ²ÙÙÙ': 'daily', 'ÙÙØ¹_Ø§ÙØ¨ÙØ§ÙØ§Øª': 'Ø´ÙÙØ¹ ÙÙÙÙØ© ØªØ§Ø±ÙØ®ÙØ© - ÙÙØ³Øª Ø£Ø³Ø¹Ø§Ø±ÙØ§ ÙØ­Ø¸ÙØ©',
-        'Ø§ÙØ¥ØºÙØ§Ù_Ø§ÙÙØ±Ø¬Ø¹Ù': price, 'Ø§ÙØ¯Ø¹Ù': support,
-        'Ø§ÙÙÙØ§ÙÙØ©': result.get('resistance60'),
-        'Ø¨Ø¯Ø§ÙØ©_ÙØ·Ø§Ù_Ø§ÙØ´Ø±Ø§Ø¡': entry, 'ÙÙØ§ÙØ©_ÙØ·Ø§Ù_Ø§ÙØ´Ø±Ø§Ø¡': entry,
-        'ÙÙÙ_ØªÙØ¯ÙØ±Ù': stop, 'ÙØ¯Ù_ØªÙØ¯ÙØ±Ù': target, 'ÙØ¯Ù_Ø«Ø§Ù': second,
-        'ÙÙÙØ©_Ø§ÙØªØ¯Ø§ÙÙ_Ø§ÙÙÙÙÙØ©_Ø§ÙÙØªÙØ³Ø·Ø©_ÙÙÙÙÙ': liquidity,
-        'Ø§ÙØ­Ø¬Ù_Ø§ÙÙØ³Ø¨Ù': relative_volume, 'RSI14': result.get('rsi14'),
-        'EMA20': None, 'EMA50': None, 'ÙØ³Ø¨Ø©_Ø§ÙØ¹Ø§Ø¦Ø¯_ÙÙÙØ®Ø§Ø·Ø±Ø©': rr,
-        'ÙÙÙØ©_Ø§ÙØªØ±Ø§Ø¶ÙØ©': shares, 'Ø¥Ø¬ÙØ§ÙÙ_Ø§ÙØ´Ø±Ø§Ø¡_Ø±ÙØ§Ù': round(shares * entry, 2),
-        'Ø§ÙØ­Ø§ÙØ©': 'ÙØ±ØµØ© ÙØ´Ø±ÙØ·Ø©' if strong else 'ÙØ§ Ø¯Ø®ÙÙ',
-        'Ø¯Ø±Ø¬Ø©_Ø§ÙØ¬ÙØ¯Ø©': score, 'Ø§ÙØ§Ø³ØªØ±Ø§ØªÙØ¬ÙØ§Øª': ','.join(active),
-        'Ø§Ø®ØªØ¨Ø§Ø±Ø§Øª_ØªØ§Ø±ÙØ®ÙØ©': {
-            key: {field: value.get(field) for field in ('samples', 'win_rate_pct', 'mean_return_pct')}
-            for key, value in tested.items()
+        "السهم": str(ticker),
+        "التاريخ": result.get("date"),
+        "الإطار_الزمني": "daily",
+        "نوع_البيانات": "شموع يومية تاريخية - ليست أسعارًا لحظية",
+        "الإغلاق_المرجعي": price,
+        "الدعم": support,
+        "المقاومة": finite(result.get("resistance60")),
+        "بداية_نطاق_الشراء": entry,
+        "نهاية_نطاق_الشراء": entry,
+        "وقف_تقديري": stop,
+        "هدف_تقديري": target,
+        "هدف_ثان": second,
+        "قيمة_التداول_اليومية_المتوسطة_مليون": liquidity,
+        "الحجم_النسبي": relative_volume,
+        "RSI14": finite(result.get("rsi14")),
+        "EMA20": None,
+        "EMA50": None,
+        "نسبة_العائد_للمخاطرة": rr,
+        "كمية_افتراضية": shares,
+        "إجمالي_الشراء_ريال": round(shares * entry, 2),
+        "الحالة": "فرصة مشروطة" if strong else "لا دخول",
+        "درجة_الجودة": score,
+        "الاستراتيجيات": ",".join(active),
+        "اختبارات_تاريخية": {
+            key: {field: val.get(field) for field in
+                  ("samples", "win_rate_pct", "mean_return_pct")}
+            for key, val in tested.items()
         },
-        'Ø§ÙØ³Ø¨Ø¨_Ø¹ÙØ¯_Ø§ÙØ±ÙØ¶': '' if strong else 'Ø´Ø±ÙØ· Ø§ÙØ§Ø³ØªØ±Ø§ØªÙØ¬ÙØ© Ø£Ù Ø§Ø®ØªØ¨Ø§Ø±ÙØ§ Ø£Ù Ø§ÙØ³ÙÙÙØ© Ø£Ù ÙØ³ØªÙÙ Ø§ÙÙØ®Ø§Ø·Ø±Ø© ØºÙØ± ÙØ§ÙÙØ©',
+        "السبب_عند_الرفض": "" if strong else "، ".join(reasons),
     }

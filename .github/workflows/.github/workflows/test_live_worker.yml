@@ -1,0 +1,70 @@
+name: Test Saudi AI Sniper Live Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile live_worker.py telegram_scan.py market_scanner.py sniper_core.py sahmk_pro.py
+
+      - name: Test live worker for 120 seconds
+        run: |
+          python - <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+
+          env = os.environ.copy()
+          env["PYTHONUNBUFFERED"] = "1"
+          env["DRY_RUN"] = "1"
+
+          process = subprocess.Popen(
+              [sys.executable, "-u", "live_worker.py"],
+              env=env,
+          )
+
+          try:
+              code = process.wait(timeout=120)
+              if code != 0:
+                  raise SystemExit(code)
+              print("Worker exited normally.")
+          except subprocess.TimeoutExpired:
+              print("Worker stayed running for 120 seconds.")
+          finally:
+              if process.poll() is None:
+                  process.terminate()
+                  try:
+                      process.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      process.kill()
+                      process.wait()
+
+          print("LIVE WORKER SMOKE TEST COMPLETED")
+          PY

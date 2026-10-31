@@ -1,13 +1,20 @@
 
-"""Saudi AI Sniper V8 - Full Market Walk-Forward Lab.
+"""Saudi AI Sniper V8.1 - Full Market Walk-Forward Lab.
 
 Research only. No orders or Telegram alerts.
-Tests all TASI equities returned by SAHMK.
+
+- Scans every TASI equity returned by SAHMK
+- Uses training-only strategy selection
+- Tests on non-overlapping future windows
+- Counts actual out-of-sample trades
+- Does not approve empty or tiny samples
+- Reports insufficient evidence separately
 """
 
 import json
 import math
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,38 +35,59 @@ TRAIN_BARS = 252
 TEST_BARS = 63
 STEP_BARS = 63
 WARMUP_BARS = 120
+
+MIN_HISTORY = (
+    WARMUP_BARS + TRAIN_BARS + TEST_BARS
+)
+
 MIN_FOLDS = 2
+MIN_SELECTED_FOLDS = 2
+MIN_TEST_TRADES = 15
 
 OUTPUT_JSON = "v8_market_lab_results.json"
 OUTPUT_CSV = "v8_market_lab_summary.csv"
 
 
+def symbol_of(item):
+    if isinstance(item, str):
+        value = item
+    elif isinstance(item, dict):
+        value = next(
+            (
+                item.get(key)
+                for key in (
+                    "symbol",
+                    "ticker",
+                    "code",
+                    "stock_code",
+                )
+                if item.get(key) is not None
+            ),
+            None,
+        )
+    else:
+        return None
+
+    if value is None:
+        return None
+
+    symbol = str(value).strip().upper()
+    symbol = symbol.replace(".SR", "")
+
+    return symbol if symbol.isdigit() else None
+
+
 def get_symbols():
     session = sahmk_session()
-    universe = tasi_equities(session)
+    items = tasi_equities(session)
 
     symbols = []
     seen = set()
 
-    for item in universe:
-        if isinstance(item, str):
-            symbol = item
-        elif isinstance(item, dict):
-            symbol = (
-                item.get("symbol")
-                or item.get("ticker")
-                or item.get("code")
-                or item.get("stock_code")
-            )
-        else:
-            continue
+    for item in items:
+        symbol = symbol_of(item)
 
-        if symbol is None:
-            continue
-
-        symbol = str(symbol).replace(".SR", "").strip()
-
-        if symbol.isdigit() and symbol not in seen:
+        if symbol and symbol not in seen:
             seen.add(symbol)
             symbols.append(symbol)
 
@@ -90,31 +118,35 @@ def walk_forward(frame, signals):
 
         for name, signal in signals.items():
             stats = backtest(
-                frame, signal, train_start, train_end
+                frame,
+                signal,
+                train_start,
+                train_end,
             )
 
             if train_eligible(stats):
                 eligible[name] = stats
 
-        selected = (
-            max(
+        selected = None
+        training_stats = None
+        test_stats = None
+
+        if eligible:
+            selected = max(
                 eligible,
                 key=lambda name: strategy_rank(
                     eligible[name]
                 ),
             )
-            if eligible else None
-        )
 
-        test = (
-            backtest(
+            training_stats = eligible[selected]
+
+            test_stats = backtest(
                 frame,
                 signals[selected],
                 test_start,
                 test_end,
             )
-            if selected else None
-        )
 
         folds.append({
             "train_start": str(
@@ -130,11 +162,8 @@ def walk_forward(frame, signals):
                 frame.index[test_end]
             )[:10],
             "selected_strategy": selected,
-            "train": (
-                eligible.get(selected)
-                if selected else None
-            ),
-            "test": test,
+            "train": training_stats,
+            "test": test_stats,
         })
 
         train_start += STEP_BARS
@@ -145,55 +174,135 @@ def walk_forward(frame, signals):
 def summarize(folds):
     selected = [
         fold for fold in folds
-        if fold["selected_strategy"]
+        if fold["selected_strategy"] is not None
         and fold["test"] is not None
     ]
 
-    trades = sum(
+    traded = [
+        fold for fold in selected
+        if fold["test"]["trades"] > 0
+    ]
+
+    total_trades = sum(
         fold["test"]["trades"]
-        for fold in selected
+        for fold in traded
     )
 
-    winning_trades = sum(
+    result = {
+        "folds": len(folds),
+        "selected_folds": len(selected),
+        "traded_folds": len(traded),
+        "test_trades": total_trades,
+        "win_rate_pct": None,
+        "average_net_pct": None,
+        "compounded_net_pct": None,
+        "profit_factor": None,
+        "worst_fold_drawdown_pct": None,
+        "sufficient_folds": False,
+        "status": "insufficient_evidence",
+    }
+
+    if total_trades == 0:
+        return result
+
+    winning = sum(
         fold["test"]["trades"]
         * fold["test"]["win_rate_pct"] / 100
-        for fold in selected
-        if fold["test"]["win_rate_pct"] is not None
+        for fold in traded
     )
 
     weighted_return = sum(
         fold["test"]["trades"]
         * fold["test"]["avg_net_pct"]
-        for fold in selected
-        if fold["test"]["avg_net_pct"] is not None
+        for fold in traded
     )
 
+    gross_profit = 0.0
+    gross_loss = 0.0
     compound = 1.0
-    for fold in selected:
-        value = fold["test"]["total_net_pct"]
-        if value is not None:
-            compound *= 1 + value / 100
+    drawdowns = []
 
-    return {
-        "folds": len(folds),
-        "selected_folds": len(selected),
-        "test_trades": trades,
-        "win_rate_pct": (
-            round(100 * winning_trades / trades, 2)
-            if trades else None
+    for fold in traded:
+        stats = fold["test"]
+        count = stats["trades"]
+
+        average = stats["avg_net_pct"] / 100
+        win_rate = stats["win_rate_pct"] / 100
+        pf = stats["profit_factor"]
+
+        # Profit factor is aggregated from the
+        # reported statistics, so this is an
+        # approximation rather than trade-level PF.
+        if pf is not None and pf > 0:
+            net_sum = average * count
+
+            if pf > 1:
+                loss = net_sum / (pf - 1)
+                if loss >= 0:
+                    gross_loss += loss
+                    gross_profit += loss * pf
+
+            elif pf < 1:
+                loss = net_sum / (pf - 1)
+                if loss >= 0:
+                    gross_loss += loss
+                    gross_profit += loss * pf
+
+        total_pct = stats["total_net_pct"]
+
+        if total_pct is not None:
+            compound *= 1 + total_pct / 100
+
+        dd = stats["max_drawdown_pct"]
+
+        if dd is not None:
+            drawdowns.append(dd)
+
+    win_rate = 100 * winning / total_trades
+    average_net = weighted_return / total_trades
+    compounded = 100 * (compound - 1)
+
+    result.update({
+        "win_rate_pct": round(win_rate, 2),
+        "average_net_pct": round(
+            average_net, 3
         ),
-        "average_net_pct": (
-            round(weighted_return / trades, 3)
-            if trades else None
+        "compounded_net_pct": round(
+            compounded, 3
         ),
-        "compounded_net_pct": (
-            round(100 * (compound - 1), 3)
-            if trades else None
+        "profit_factor": (
+            round(gross_profit / gross_loss, 3)
+            if gross_loss > 0 else None
         ),
-        "sufficient_folds": (
-            len(selected) >= MIN_FOLDS
+        "worst_fold_drawdown_pct": (
+            round(min(drawdowns), 3)
+            if drawdowns else None
         ),
-    }
+    })
+
+    sufficient = (
+        len(folds) >= MIN_FOLDS
+        and len(selected) >= MIN_SELECTED_FOLDS
+        and total_trades >= MIN_TEST_TRADES
+    )
+
+    result["sufficient_folds"] = sufficient
+
+    if not sufficient:
+        result["status"] = "insufficient_evidence"
+    elif (
+        average_net > 0
+        and compounded > 0
+        and (
+            result["profit_factor"] is not None
+            and result["profit_factor"] > 1
+        )
+    ):
+        result["status"] = "historically_positive"
+    else:
+        result["status"] = "historically_negative"
+
+    return result
 
 
 def analyze(symbol):
@@ -203,11 +312,12 @@ def analyze(symbol):
         return {
             "symbol": symbol,
             "status": "insufficient_history",
+            "bars": 0,
         }
 
     raw = complete_daily(clean(raw))
 
-    if raw is None or len(raw) < 450:
+    if raw is None or len(raw) < MIN_HISTORY:
         return {
             "symbol": symbol,
             "status": "insufficient_history",
@@ -216,8 +326,8 @@ def analyze(symbol):
 
     frame = build_features(raw)
     signals = candidate_signals(frame)
-    folds = walk_forward(frame, signals)
 
+    folds = walk_forward(frame, signals)
     summary = summarize(folds)
 
     return {
@@ -227,7 +337,8 @@ def analyze(symbol):
         "summary": summary,
         "folds": folds,
         "active_strategies": [
-            name for name, signal in signals.items()
+            name
+            for name, signal in signals.items()
             if bool(signal.iloc[-1])
         ],
     }
@@ -237,16 +348,18 @@ def main():
     symbols = get_symbols()
 
     if not symbols:
-        raise RuntimeError("No TASI symbols returned")
+        raise RuntimeError(
+            "SAHMK returned no TASI equities"
+        )
 
     print(
-        "V8 FULL MARKET WALK-FORWARD",
-        "Stocks:", len(symbols),
+        "V8.1 FULL MARKET WALK-FORWARD",
+        "STOCKS:", len(symbols),
         flush=True,
     )
 
     report = {
-        "engine": "Saudi AI Sniper V8 Market Lab",
+        "engine": "Saudi AI Sniper V8.1 Market Lab",
         "generated_utc": datetime.now(
             timezone.utc
         ).isoformat(),
@@ -256,13 +369,19 @@ def main():
             "test_bars": TEST_BARS,
             "step_bars": STEP_BARS,
             "minimum_folds": MIN_FOLDS,
+            "minimum_selected_folds":
+                MIN_SELECTED_FOLDS,
+            "minimum_test_trades":
+                MIN_TEST_TRADES,
         },
         "stocks": {},
     }
 
     rows = []
 
-    for number, symbol in enumerate(symbols, 1):
+    for number, symbol in enumerate(
+        symbols, start=1
+    ):
         print(
             f"[{number}/{len(symbols)}] {symbol}",
             flush=True,
@@ -292,6 +411,9 @@ def main():
             "selected_folds": summary.get(
                 "selected_folds"
             ),
+            "traded_folds": summary.get(
+                "traded_folds"
+            ),
             "test_trades": summary.get(
                 "test_trades"
             ),
@@ -304,13 +426,29 @@ def main():
             "compounded_net_pct": summary.get(
                 "compounded_net_pct"
             ),
+            "profit_factor": summary.get(
+                "profit_factor"
+            ),
+            "research_status": summary.get(
+                "status"
+            ),
             "sufficient_folds": summary.get(
                 "sufficient_folds"
             ),
             "error": result.get("error"),
         })
 
-    Path(OUTPUT_JSON).write_text(
+        print(
+            "STATUS:",
+            result["status"],
+            "RESEARCH:",
+            summary.get("status", "-"),
+            "TRADES:",
+            summary.get("test_trades", 0),
+            flush=True,
+        )
+
+    Path("v8_market_lab_results.json").write_text(
         json.dumps(
             report,
             ensure_ascii=False,
@@ -321,26 +459,51 @@ def main():
     )
 
     pd.DataFrame(rows).to_csv(
-        OUTPUT_CSV,
+        "v8_market_lab_summary.csv",
         index=False,
         encoding="utf-8-sig",
     )
 
-    successful = sum(
-        result["status"] == "ok"
+    counts = Counter(
+        result["status"]
         for result in report["stocks"].values()
     )
 
-    print(
-        f"Analyzed: {successful}/{len(symbols)}",
-        flush=True,
-    )
-    print("Saved:", OUTPUT_JSON, OUTPUT_CSV)
-
-    if successful == 0:
-        raise RuntimeError(
-            "No successful analyses"
+    research_counts = Counter(
+        (result.get("summary") or {}).get(
+            "status"
         )
+        for result in report["stocks"].values()
+        if result["status"] == "ok"
+    )
+
+    print("\n===== FINAL RESULTS =====")
+    print("TOTAL:", len(symbols))
+    print("ANALYZED:", counts["ok"])
+    print(
+        "INSUFFICIENT HISTORY:",
+        counts["insufficient_history"],
+    )
+    print("ERRORS:", counts["error"])
+    print(
+        "HISTORICALLY POSITIVE:",
+        research_counts["historically_positive"],
+    )
+    print(
+        "HISTORICALLY NEGATIVE:",
+        research_counts["historically_negative"],
+    )
+    print(
+        "INSUFFICIENT EVIDENCE:",
+        research_counts["insufficient_evidence"],
+    )
+
+    if counts["ok"] == 0:
+        raise RuntimeError(
+            "No successful stock analyses"
+        )
+
+    print("V8.1 MARKET LAB COMPLETED")
 
 
 if __name__ == "__main__":

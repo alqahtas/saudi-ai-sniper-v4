@@ -4,6 +4,9 @@ name: Test Market Scanner
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test-market:
     runs-on: ubuntu-latest
@@ -16,10 +19,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests yfinance pandas numpy
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install requests yfinance pandas numpy
 
       - name: Scan entire TASI market
         env:
@@ -33,31 +39,70 @@ jobs:
               quote_budget=0
           )
 
-          total = result["universe_size"]
-          failed = len(result["historical_failures"])
-          selected = len(result["historical_candidates"])
+          total = result.get("universe_size", 0)
+          summary = result.get("summary") or {}
+          failed = result.get("historical_failures") or []
+          candidates = result.get("historical_candidates") or []
+          weekly = result.get("weekly_candidates") or []
 
-          print("TASI stocks found:", total)
-          print("Successfully analyzed:", total - failed)
-          print("Historical failures:", failed)
-          print("Top candidates:", selected)
+          analyzed = int(summary.get("analyzed", 0))
 
-          for stock in result["historical_candidates"][:10]:
+          print("\n========== TASI SCAN ==========")
+          print("Stocks selected:", total)
+          print("Successfully analyzed:", analyzed)
+          print("Historical failures:", len(failed))
+          print("Watchlist candidates:", len(candidates))
+          print("Weekly setups:", len(weekly))
+          print(
+              "Validated daily setups:",
+              summary.get("validated_setups", 0)
+          )
+
+          print("\n========== TOP WATCHLIST ==========")
+
+          for stock in candidates[:20]:
+              if not isinstance(stock, dict):
+                  continue
+
               print(
-                  stock["السهم"],
-                  stock["اسم_الشركة"],
-                  "Score:", stock["درجة_الجودة"],
-                  "Status:", stock["الحالة"]
+                  "Symbol:",
+                  stock.get("السهم", "N/A"),
+                  "| Company:",
+                  stock.get("اسم_الشركة", "N/A"),
+                  "| Score:",
+                  stock.get("درجة_الجودة", "N/A"),
+                  "| Status:",
+                  stock.get(
+                      "الحالة",
+                      stock.get("تصنيف_الماسح", "N/A")
+                  )
               )
 
-          if total == 0 or total - failed == 0:
-              raise RuntimeError("No stocks analyzed")
+          print("\n========== HISTORICAL FAILURES ==========")
+
+          for item in failed[:20]:
+              print(str(item)[:300])
+
+          if total == 0:
+              raise RuntimeError(
+                  "No TASI stocks returned from directory"
+              )
+
+          if analyzed == 0:
+              raise RuntimeError(
+                  "No stocks were successfully analyzed"
+              )
+
+          print("\nSCAN TEST PASSED")
           PY
 
-      - name: Save market scan results
+      - name: Upload market scan results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tasi-market-scan
-          path: market_scan_result.json
+          path: |
+            market_scan_result.json
+            market_scan_summary.txt
           if-no-files-found: warn
+          retention-days: 14

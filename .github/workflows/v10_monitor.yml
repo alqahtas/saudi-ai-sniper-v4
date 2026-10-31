@@ -10,7 +10,7 @@ permissions:
 jobs:
   scan-market:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -23,19 +23,35 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pandas numpy requests
 
-      - name: Scan all Saudi stocks
+      - name: Check V10 files
+        run: |
+          python -m py_compile v10_live_monitor.py
+          if [ -f v10_watchlist.json ]; then
+            echo "V10 watchlist exists"
+          else
+            echo "::error::v10_watchlist.json is missing"
+            echo "The historical scan artifact must be restored."
+            exit 1
+          fi
+
+      - name: Test SAHMK Pro connection
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+          SAHMK_BASE_URL: ${{ vars.SAHMK_BASE_URL }}
         run: |
-          python -u v10_live_monitor.py --scan
+          python -u v10_live_monitor.py --check
 
-      - name: Upload V10 watchlist
+      - name: Upload V10 diagnostic files
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v10-market-watchlist
-          path: v10_watchlist.json
-          if-no-files-found: warn
+          name: v10-diagnostics
+          path: |
+            v10_watchlist.json
+            v10_monitor_state.json
+            v10_events.json
+          if-no-files-found: ignore

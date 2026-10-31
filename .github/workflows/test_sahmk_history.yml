@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -20,7 +20,7 @@ jobs:
       - name: Install requests
         run: pip install requests
 
-      - name: Test 500 historical candles
+      - name: Test historical date range
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
         run: |
@@ -30,15 +30,20 @@ jobs:
 
           url = "https://api.sahmk.sa/api/v1/historical/1120/"
 
+          params = {
+              "interval": "1d",
+              "from": "2024-01-01",
+              "to": "2026-10-30",
+              "limit": 500,
+              "offset": 0
+          }
+
           response = requests.get(
               url,
               headers={
                   "X-API-Key": os.environ["SAHMK_API_KEY"]
               },
-              params={
-                  "interval": "1d",
-                  "limit": 500
-              },
+              params=params,
               timeout=40
           )
 
@@ -46,20 +51,25 @@ jobs:
           response.raise_for_status()
 
           payload = response.json()
+
           candles = payload.get("data", [])
 
+          print("SYMBOL:", payload.get("symbol"))
+          print("FROM:", payload.get("from"))
+          print("TO:", payload.get("to"))
           print("TOTAL AVAILABLE:", payload.get("total"))
           print("CANDLES RECEIVED:", len(candles))
           print("HAS MORE:", payload.get("has_more"))
           print("LIMIT:", payload.get("limit"))
 
           if candles:
+              print("FIRST DATE:", candles[0].get("date"))
+              print("LAST DATE:", candles[-1].get("date"))
               print("CANDLE FIELDS:", list(candles[0].keys()))
-              print("FIRST CANDLE:", candles[0])
-              print("LAST CANDLE:", candles[-1])
 
           if len(candles) >= 300:
-              print("SUCCESS: Enough candles for analysis")
+              print("SUCCESS: ENOUGH HISTORICAL DATA")
           else:
-              print("WARNING: Fewer than 300 candles")
+              print("WARNING: INSUFFICIENT HISTORICAL DATA")
+
           PY

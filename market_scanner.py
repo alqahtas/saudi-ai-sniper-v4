@@ -1,4 +1,3 @@
-
 """Saudi AI Sniper V5.3 — activity-filtered historical TASI scanner.
 Read-only; no orders or live-entry confirmation.
 """
@@ -16,7 +15,7 @@ BASE_URL = "https://api.sahmk.sa/api/v1"
 TZ = ZoneInfo("Asia/Riyadh")
 LOG = logging.getLogger(__name__)
 MIN_LIQUIDITY_M_SAR = 20.0
-UNIVERSE_LIMIT = max(10, min(100, int(os.getenv("SCAN_UNIVERSE_LIMIT", "100"))))
+UNIVERSE_LIMIT = max(1, int(os.getenv("SCAN_UNIVERSE_LIMIT", "1000")))
 
 
 def fix_text(value):
@@ -293,7 +292,7 @@ def run(max_candidates=50, quote_budget=0):
     LOG.info("Historical scanner requested")
     session = sahmk_session()
     all_symbols = tasi_equities(session)
-    symbols = select_active_equities(all_symbols, session, UNIVERSE_LIMIT)
+    symbols = dict(list(all_symbols.items())[:UNIVERSE_LIMIT])
     LOG.info("SAHMK directory=%d selected=%d", len(all_symbols), len(symbols))
     ranked, weeklies, failed, stats = scan_universe(symbols, max_candidates)
     quotes = verify_quotes(ranked, session, budget=quote_budget)
@@ -301,7 +300,7 @@ def run(max_candidates=50, quote_budget=0):
         "scanned_at_utc": datetime.now(timezone.utc).isoformat(),
         "market": "TASI", "universe_size": len(symbols),
         "directory_size": len(all_symbols),
-        "selection_method": "current trading-value leaders + trading-volume leaders (not historical top 100)",
+        "selection_method": "all active TASI equities from SAHMK company directory, capped by SCAN_UNIVERSE_LIMIT",
         "summary": stats,
         "historical_candidates": ranked + weeklies,
         "weekly_candidates": weeklies,
@@ -313,7 +312,7 @@ def run(max_candidates=50, quote_budget=0):
         json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     lines = [
-        "SAUDI AI SNIPER V5.3 - HISTORICAL SCAN",
+        "SAUDI AI SNIPER V8 - FULL MARKET HISTORICAL SCAN",
         f"Directory: {len(all_symbols)}", f"Selected: {len(symbols)}",
         f"Analyzed: {stats.get('analyzed', 0)}", f"Errors: {len(failed)}",
         f"Daily setups: {stats.get('validated_setups', 0)}",

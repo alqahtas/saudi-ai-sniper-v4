@@ -11,13 +11,9 @@ import os
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 LOG = logging.getLogger(__name__)
 
-CAPITAL_SAR = 50000
-MAX_ENTRY_SAR = 10000
-RISK_PER_TRADE_SAR = 150
 MIN_AVG_VALUE_SAR = 20000000
 
 STOP_PCT = 0.01
@@ -42,65 +38,89 @@ WATCHLIST = (
 
 
 def daily(ticker):
-    symbol = str(ticker).strip().upper()
-    if not symbol.endswith(".SR"):
-        symbol += ".SR"
+    """Fetch daily OHLCV from SAHMK; never silently fall back to Yahoo.
 
-    data = yf.download(
-        symbol,
-        period="5y",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-        timeout=18,
-        multi_level_index=False,
-    )
-    return clean(data)
+    API response structures can vary. Invalid/missing data returns None.
+    """
+    import requests
+
+    symbol = str(ticker).strip().upper().replace(".SR", "")
+    if symbol in ("^TASI", "^TASI.SR"):
+        symbol = "TASI"
+    if not (symbol.isdigit() or symbol == "TASI"):
+        return None
+    key = os.getenv("SAHMK_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("SAHMK_API_KEY is missing")
+    url = f"https://api.sahmk.sa/api/v1/historical/{symbol}/"
+    response = requests.get(url, headers={"X-API-Key": key},
+                            params={"interval": "1d"}, timeout=35)
+    response.raise_for_status()
+    payload = response.json()
+    rows = _historical_rows(payload)
+    if not rows:
+        LOG.warning("No usable SAHMK candles for %s", symbol)
+        return None
+    frame = pd.DataFrame(rows)
+    return clean(frame)
+
+
+def _historical_rows(payload):
+    """Unwrap common paginated historical candle response shapes."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("results", "candles", "history", "historical", "data", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = _historical_rows(value)
+            if nested:
+                return nested
+    return []
 
 
 def clean(data):
-    if data is None or len(data) == 0:
+    if data is None or isinstance(data, (str, bytes)):
         return None
-
+    if isinstance(data, (list, dict)):
+        data = pd.DataFrame(data)
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return None
     x = data.copy()
-
     if isinstance(x.columns, pd.MultiIndex):
         x.columns = x.columns.get_level_values(0)
-
-    x.columns = [
-        str(c).strip().title() for c in x.columns
-    ]
-
+    aliases = {
+        "date": "Date", "datetime": "Date", "timestamp": "Date",
+        "time": "Date", "trading_date": "Date",
+        "open": "Open", "o": "Open", "high": "High", "h": "High",
+        "low": "Low", "l": "Low", "close": "Close", "c": "Close",
+        "volume": "Volume", "v": "Volume", "trading_volume": "Volume",
+    }
+    x.columns = [aliases.get(str(c).strip().lower(), str(c).strip())
+                 for c in x.columns]
+    if not isinstance(x.index, pd.DatetimeIndex):
+        if "Date" not in x.columns:
+            return None
+        dates = pd.to_datetime(x["Date"], errors="coerce", utc=True)
+        x.index = pd.DatetimeIndex(dates).tz_localize(None)
+    elif x.index.tz is not None:
+        x.index = x.index.tz_localize(None)
     required = ["Open", "High", "Low", "Close", "Volume"]
-
     if any(c not in x.columns for c in required):
         return None
-
     x = x[required].copy()
-
     for column in required:
-        x[column] = pd.to_numeric(
-            x[column], errors="coerce"
-        )
-
-    x = x.replace([np.inf, -np.inf], np.nan)
-    x = x.dropna(subset=required)
-    x = x[
-        (x["Open"] > 0)
-        & (x["High"] > 0)
-        & (x["Low"] > 0)
-        & (x["Close"] > 0)
-        & (x["Volume"] >= 0)
-    ]
-
+        x[column] = pd.to_numeric(x[column], errors="coerce")
+    x = x.replace([np.inf, -np.inf], np.nan).dropna(subset=required)
+    x = x[(x["Open"] > 0) & (x["High"] > 0) &
+          (x["Low"] > 0) & (x["Close"] > 0) & (x["Volume"] >= 0)]
     x = x.sort_index()
     x = x[~x.index.duplicated(keep="last")]
-
-    if len(x) < 300:
-        return None
-
-    return x
+    x = x[x.index.notna()]
+    return x if len(x) >= 300 else None
 
 
 def indicators(data):
@@ -507,6 +527,8 @@ def strategy_research(x):
 def calculate(data, ticker=None, *args, **kwargs):
     """Return scanner-compatible Arabic result fields."""
 
+    if isinstance(data, (str, int)) and isinstance(ticker, (pd.DataFrame, list, dict)):
+        data, ticker = ticker, str(data)
     x = indicators(data)
 
     selected, approved, results, signal_map = (
@@ -542,26 +564,10 @@ def calculate(data, ticker=None, *args, **kwargs):
     stop = round(entry * (1 - STOP_PCT), 2)
     target = round(entry * (1 + TARGET_PCT), 2)
 
-    risk_per_share = max(entry - stop, 0.01)
-
-    shares_by_risk = int(
-        RISK_PER_TRADE_SAR / risk_per_share
-    )
-
-    shares_by_budget = int(
-        min(CAPITAL_SAR, MAX_ENTRY_SAR) / entry
-    )
-
-    shares = max(
-        0,
-        min(shares_by_risk, shares_by_budget),
-    )
-
     valid = bool(
         approved
         and selected_active
         and liquid
-        and shares >= 1
     )
 
     selected_test = (
@@ -634,16 +640,17 @@ def calculate(data, ticker=None, *args, **kwargs):
         "هدف_الربح": target,
         "نسبة_الهدف": 2.0,
         "نسبة_الوقف": 1.0,
-        "الكمية": shares,
-        "قيمة_الصفقة": round(shares * entry, 2),
-        "المخاطرة_بالريال":
-            round(shares * risk_per_share, 2),
+        "الكمية": None,
+        "قيمة_الصفقة": None,
+        "المخاطرة_بالريال": None,
         "السيولة": round(avgvalue, 2),
         "متوسط_قيمة_التداول": round(avgvalue, 2),
         "حجم_نسبي": round(relvol, 2),
         "RSI": round(rsi, 2),
         "الدعم": round(support, 2),
         "المقاومة": round(resistance, 2),
+        "درجة_الجودة": score,
+        "قيمة_التداول_اليومية_المتوسطة_مليون": round(avgvalue / 1_000_000, 3),
         "التقييم": score,
         "الدرجة": score,
         "score": score,

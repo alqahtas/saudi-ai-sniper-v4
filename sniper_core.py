@@ -1,24 +1,23 @@
 
-"""Saudi AI Sniper V6.1 — Strategy Research Engine.
+"""Saudi AI Sniper V8 - SAHMK Historical Research Engine.
 
-Research and alerts only. No automatic orders.
-Target: +2% | Stop: -1%.
-Historical performance does not guarantee future returns.
+Read-only analysis. No automatic trading.
+Historical results are not guaranteed future returns.
 """
 
 import logging
 import os
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 
 LOG = logging.getLogger(__name__)
 
-MIN_AVG_VALUE_SAR = 20000000
-
+MIN_AVG_VALUE_SAR = 20_000_000
 STOP_PCT = 0.01
 TARGET_PCT = 0.02
-TARGET_R = 2.0
 MAX_HOLD_DAYS = 12
 ROUND_TRIP_COST = 0.003
 
@@ -37,89 +36,207 @@ WATCHLIST = (
 ).split()
 
 
-def daily(ticker):
-    """Fetch daily OHLCV from SAHMK; never silently fall back to Yahoo.
-
-    API response structures can vary. Invalid/missing data returns None.
-    """
-    import requests
-
-    symbol = str(ticker).strip().upper().replace(".SR", "")
-    if symbol in ("^TASI", "^TASI.SR"):
-        symbol = "TASI"
-    if not (symbol.isdigit() or symbol == "TASI"):
-        return None
-    key = os.getenv("SAHMK_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("SAHMK_API_KEY is missing")
-    url = f"https://api.sahmk.sa/api/v1/historical/{symbol}/"
-    response = requests.get(url, headers={"X-API-Key": key},
-                            params={"interval": "1d"}, timeout=35)
-    response.raise_for_status()
-    payload = response.json()
-    rows = _historical_rows(payload)
-    if not rows:
-        LOG.warning("No usable SAHMK candles for %s", symbol)
-        return None
-    frame = pd.DataFrame(rows)
-    return clean(frame)
-
-
 def _historical_rows(payload):
-    """Unwrap common paginated historical candle response shapes."""
     if isinstance(payload, list):
         return payload
+
     if not isinstance(payload, dict):
         return []
-    for key in ("results", "candles", "history", "historical", "data", "items"):
+
+    for key in (
+        "data", "results", "candles",
+        "history", "historical", "items"
+    ):
         value = payload.get(key)
+
         if isinstance(value, list):
             return value
+
         if isinstance(value, dict):
-            nested = _historical_rows(value)
-            if nested:
-                return nested
+            rows = _historical_rows(value)
+            if rows:
+                return rows
+
     return []
+
+
+def daily(ticker):
+    """Retrieve up to three years of SAHMK daily candles."""
+
+    symbol = str(ticker).strip().upper()
+    symbol = symbol.replace(".SR", "")
+
+    if symbol in ("^TASI", "TASI"):
+        symbol = "TASI"
+    elif not symbol.isdigit():
+        raise ValueError("Invalid symbol: " + symbol)
+
+    key = os.getenv("SAHMK_API_KEY", "").strip()
+
+    if not key:
+        raise RuntimeError("SAHMK_API_KEY is missing")
+
+    end = date.today()
+    start = end - timedelta(days=1100)
+
+    url = (
+        "https://api.sahmk.sa/api/v1/"
+        f"historical/{symbol}/"
+    )
+
+    rows = []
+    offset = 0
+    limit = 500
+
+    session = requests.Session()
+
+    for page in range(10):
+        response = session.get(
+            url,
+            headers={"X-API-Key": key},
+            params={
+                "interval": "1d",
+                "from": start.isoformat(),
+                "to": end.isoformat(),
+                "limit": limit,
+                "offset": offset,
+            },
+            timeout=40,
+        )
+
+        response.raise_for_status()
+        payload = response.json()
+
+        batch = _historical_rows(payload)
+
+        if not batch:
+            break
+
+        rows.extend(batch)
+
+        if not isinstance(payload, dict):
+            break
+
+        if not payload.get("has_more", False):
+            break
+
+        new_offset = offset + len(batch)
+
+        if new_offset <= offset:
+            break
+
+        offset = new_offset
+
+    if not rows:
+        LOG.warning(
+            "No historical candles for %s", symbol
+        )
+        return None
+
+    result = clean(pd.DataFrame(rows))
+
+    if result is None:
+        LOG.warning(
+            "%s: insufficient or invalid candles (%s)",
+            symbol, len(rows)
+        )
+
+    return result
 
 
 def clean(data):
     if data is None or isinstance(data, (str, bytes)):
         return None
-    if isinstance(data, (list, dict)):
+
+    if isinstance(data, (dict, list)):
         data = pd.DataFrame(data)
-    if not isinstance(data, pd.DataFrame) or data.empty:
+
+    if not isinstance(data, pd.DataFrame):
         return None
+
+    if data.empty:
+        return None
+
     x = data.copy()
+
     if isinstance(x.columns, pd.MultiIndex):
         x.columns = x.columns.get_level_values(0)
+
     aliases = {
-        "date": "Date", "datetime": "Date", "timestamp": "Date",
-        "time": "Date", "trading_date": "Date",
-        "open": "Open", "o": "Open", "high": "High", "h": "High",
-        "low": "Low", "l": "Low", "close": "Close", "c": "Close",
-        "volume": "Volume", "v": "Volume", "trading_volume": "Volume",
+        "date": "Date",
+        "datetime": "Date",
+        "timestamp": "Date",
+        "time": "Date",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+        "turnover": "Turnover",
+        "value": "Turnover",
     }
-    x.columns = [aliases.get(str(c).strip().lower(), str(c).strip())
-                 for c in x.columns]
+
+    x.columns = [
+        aliases.get(str(c).lower(), str(c))
+        for c in x.columns
+    ]
+
     if not isinstance(x.index, pd.DatetimeIndex):
         if "Date" not in x.columns:
             return None
-        dates = pd.to_datetime(x["Date"], errors="coerce", utc=True)
-        x.index = pd.DatetimeIndex(dates).tz_localize(None)
+
+        dates = pd.to_datetime(
+            x["Date"],
+            errors="coerce",
+            utc=True
+        )
+
+        x.index = pd.DatetimeIndex(
+            dates
+        ).tz_localize(None)
+
     elif x.index.tz is not None:
         x.index = x.index.tz_localize(None)
-    required = ["Open", "High", "Low", "Close", "Volume"]
+
+    required = [
+        "Open", "High", "Low",
+        "Close", "Volume"
+    ]
+
     if any(c not in x.columns for c in required):
         return None
-    x = x[required].copy()
-    for column in required:
-        x[column] = pd.to_numeric(x[column], errors="coerce")
-    x = x.replace([np.inf, -np.inf], np.nan).dropna(subset=required)
-    x = x[(x["Open"] > 0) & (x["High"] > 0) &
-          (x["Low"] > 0) & (x["Close"] > 0) & (x["Volume"] >= 0)]
+
+    columns = required.copy()
+
+    if "Turnover" in x.columns:
+        columns.append("Turnover")
+
+    x = x[columns].copy()
+
+    for column in columns:
+        x[column] = pd.to_numeric(
+            x[column],
+            errors="coerce"
+        )
+
+    x = x.replace(
+        [np.inf, -np.inf], np.nan
+    )
+
+    x = x.dropna(subset=required)
+
+    x = x[
+        (x["Open"] > 0)
+        & (x["High"] > 0)
+        & (x["Low"] > 0)
+        & (x["Close"] > 0)
+        & (x["Volume"] >= 0)
+    ]
+
+    x = x[x.index.notna()]
     x = x.sort_index()
     x = x[~x.index.duplicated(keep="last")]
-    x = x[x.index.notna()]
+
     return x if len(x) >= 300 else None
 
 
@@ -127,99 +244,114 @@ def indicators(data):
     x = clean(data)
 
     if x is None:
-        raise ValueError("Insufficient OHLCV history")
+        raise ValueError(
+            "At least 300 valid daily candles required"
+        )
 
-    close = x["Close"]
-    high = x["High"]
-    low = x["Low"]
-    volume = x["Volume"]
+    c = x["Close"]
+    h = x["High"]
+    l = x["Low"]
+    v = x["Volume"]
 
-    x["ema20"] = close.ewm(
-        span=20, adjust=False
-    ).mean()
-    x["ema50"] = close.ewm(
-        span=50, adjust=False
-    ).mean()
-    x["ema100"] = close.ewm(
-        span=100, adjust=False
-    ).mean()
+    for period in (20, 50, 100):
+        x[f"ema{period}"] = c.ewm(
+            span=period,
+            adjust=False
+        ).mean()
 
-    delta = close.diff()
+    delta = c.diff()
+
     gain = delta.clip(lower=0).ewm(
-        alpha=1 / 14, adjust=False
+        alpha=1 / 14,
+        adjust=False
     ).mean()
+
     loss = (-delta.clip(upper=0)).ewm(
-        alpha=1 / 14, adjust=False
+        alpha=1 / 14,
+        adjust=False
     ).mean()
 
     rs = gain / loss.replace(0, np.nan)
-    x["rsi"] = 100 - 100 / (1 + rs)
-    x["rsi"] = x["rsi"].fillna(50)
 
-    prev_close = close.shift(1)
-    true_range = pd.concat(
+    x["rsi"] = (
+        100 - 100 / (1 + rs)
+    ).fillna(50)
+
+    previous = c.shift(1)
+
+    tr = pd.concat(
         [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
+            h - l,
+            (h - previous).abs(),
+            (l - previous).abs()
         ],
-        axis=1,
+        axis=1
     ).max(axis=1)
 
-    x["atr"] = true_range.ewm(
-        alpha=1 / 14, adjust=False
+    x["atr"] = tr.ewm(
+        alpha=1 / 14,
+        adjust=False
     ).mean()
 
-    x["support"] = low.shift(1).rolling(
-        30, min_periods=30
+    x["support"] = l.shift(1).rolling(
+        30
     ).min()
 
-    x["resistance"] = high.shift(1).rolling(
-        30, min_periods=30
+    x["resistance"] = h.shift(1).rolling(
+        30
     ).max()
 
-    average_volume = volume.shift(1).rolling(
-        20, min_periods=20
+    avg_volume = v.shift(1).rolling(
+        20
     ).mean()
 
-    x["relvol"] = volume / average_volume.replace(
+    x["relvol"] = (
+        v / avg_volume.replace(0, np.nan)
+    )
+
+    if "Turnover" in x.columns:
+        value = x["Turnover"].where(
+            x["Turnover"] > 0,
+            c * v
+        )
+    else:
+        value = c * v
+
+    x["avgvalue"] = value.shift(1).rolling(
+        20
+    ).mean()
+
+    candle_range = (h - l).replace(
         0, np.nan
     )
 
-    x["avgvalue"] = (
-        close * volume
-    ).shift(1).rolling(
-        20, min_periods=20
-    ).mean()
-
-    candle_range = (
-        high - low
-    ).replace(0, np.nan)
-
     x["lowerwick"] = (
-        np.minimum(x["Open"], close) - low
+        np.minimum(x["Open"], c) - l
     ) / candle_range
 
     x["closepos"] = (
-        close - low
+        c - l
     ) / candle_range
 
     x["macd"] = (
-        close.ewm(span=12, adjust=False).mean()
-        - close.ewm(span=26, adjust=False).mean()
+        c.ewm(span=12, adjust=False).mean()
+        - c.ewm(span=26, adjust=False).mean()
     )
 
     x["macd_signal"] = x["macd"].ewm(
-        span=9, adjust=False
+        span=9,
+        adjust=False
     ).mean()
 
     return x
 
 
 def signals(x):
-    liquid = x["avgvalue"] >= MIN_AVG_VALUE_SAR
+    liquid = (
+        x["avgvalue"] >= MIN_AVG_VALUE_SAR
+    )
 
-    uptrend = (
+    trend = (
         (x["Close"] > x["ema50"])
         & (x["ema20"] > x["ema50"])
         & (x["ema50"] > x["ema100"])
@@ -237,20 +369,23 @@ def signals(x):
         & (x["closepos"] >= 0.60)
     )
 
-    resistance_breakout = (
+    breakout = (
         liquid
-        & uptrend
+        & trend
         & (x["Close"] > x["resistance"])
         & (x["relvol"] >= 1.30)
         & x["rsi"].between(50, 78)
         & bullish
     )
 
-    trend_momentum = (
+    momentum = (
         liquid
-        & uptrend
+        & trend
         & (x["Close"] > x["ema20"])
-        & (x["Close"].shift(1) <= x["ema20"].shift(1))
+        & (
+            x["Close"].shift(1)
+            <= x["ema20"].shift(1)
+        )
         & (x["relvol"] >= 1.10)
         & x["rsi"].between(45, 70)
         & (x["macd"] > x["macd_signal"])
@@ -258,32 +393,30 @@ def signals(x):
 
     votes = (
         support_rebound.astype(int)
-        + resistance_breakout.astype(int)
-        + trend_momentum.astype(int)
+        + breakout.astype(int)
+        + momentum.astype(int)
     )
 
-    ensemble = liquid & (votes >= 2)
-
     return {
-        "support_rebound": support_rebound.fillna(False),
-        "resistance_breakout": resistance_breakout.fillna(False),
-        "trend_momentum": trend_momentum.fillna(False),
-        "ensemble": ensemble.fillna(False),
+        "support_rebound":
+            support_rebound.fillna(False),
+        "resistance_breakout":
+            breakout.fillna(False),
+        "trend_momentum":
+            momentum.fillna(False),
+        "ensemble":
+            (liquid & (votes >= 2)).fillna(False),
     }
 
 
 def simulate(x, signal, start, end):
-    """Backtest with next-session entry and conservative stops."""
-
     trades = []
     equity = 1.0
-    equity_curve = [equity]
+    curve = [equity]
 
     n = len(x)
-    start = max(1, int(start))
+    i = max(1, int(start))
     end = min(int(end), n - 2)
-
-    i = start
 
     while i <= end:
         if not bool(signal.iloc[i]):
@@ -291,10 +424,6 @@ def simulate(x, signal, start, end):
             continue
 
         entry_day = i + 1
-
-        if entry_day >= n:
-            break
-
         entry = float(x["Open"].iloc[entry_day])
 
         if not np.isfinite(entry) or entry <= 0:
@@ -304,54 +433,50 @@ def simulate(x, signal, start, end):
         stop = entry * (1 - STOP_PCT)
         target = entry * (1 + TARGET_PCT)
 
-        final_day = min(
+        last_day = min(
             entry_day + MAX_HOLD_DAYS - 1,
-            n - 1,
+            n - 1
         )
 
+        exit_day = last_day
         exit_price = float(
-            x["Close"].iloc[final_day]
+            x["Close"].iloc[last_day]
         )
-        exit_day = final_day
-        exit_reason = "time_exit"
+        reason = "time_exit"
 
-        for j in range(entry_day, final_day + 1):
+        for j in range(entry_day, last_day + 1):
             op = float(x["Open"].iloc[j])
-            lo = float(x["Low"].iloc[j])
-            hi = float(x["High"].iloc[j])
+            low = float(x["Low"].iloc[j])
+            high = float(x["High"].iloc[j])
 
             if op <= stop:
                 exit_price = op
                 exit_day = j
-                exit_reason = "stop_gap"
+                reason = "stop_gap"
                 break
 
             if op >= target:
                 exit_price = target
                 exit_day = j
-                exit_reason = "target_gap"
+                reason = "target_gap"
                 break
 
-            # If stop and target both occur in the same
-            # daily candle, assume stop happens first.
-            if lo <= stop:
+            if low <= stop:
                 exit_price = stop
                 exit_day = j
-                exit_reason = "stop"
+                reason = "stop"
                 break
 
-            if hi >= target:
+            if high >= target:
                 exit_price = target
                 exit_day = j
-                exit_reason = "target"
+                reason = "target"
                 break
 
-        gross_return = (
-            exit_price / entry - 1
-        )
-
         net_return = (
-            gross_return - ROUND_TRIP_COST
+            exit_price / entry
+            - 1
+            - ROUND_TRIP_COST
         )
 
         trades.append({
@@ -359,20 +484,20 @@ def simulate(x, signal, start, end):
             "exit_index": exit_day,
             "entry": entry,
             "exit": exit_price,
-            "gross_return": gross_return,
+            "gross_return":
+                exit_price / entry - 1,
             "net_return": net_return,
-            "reason": exit_reason,
+            "reason": reason,
         })
 
-        equity *= max(0.0, 1 + net_return)
-        equity_curve.append(equity)
+        equity *= max(0, 1 + net_return)
+        curve.append(equity)
 
-        # Do not open overlapping positions.
         i = exit_day + 1
 
-    returns = np.array(
+    returns = np.asarray(
         [t["net_return"] for t in trades],
-        dtype=float,
+        dtype=float
     )
 
     count = len(returns)
@@ -394,17 +519,18 @@ def simulate(x, signal, start, end):
     wins = returns[returns > 0]
     losses = returns[returns <= 0]
 
-    gross_profit = float(wins.sum())
-    gross_loss = float(abs(losses.sum()))
+    profit = float(wins.sum())
+    loss = float(abs(losses.sum()))
 
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else (99.0 if gross_profit > 0 else 0.0)
+    pf = (
+        profit / loss
+        if loss > 0
+        else (99.0 if profit > 0 else 0.0)
     )
 
-    curve = np.asarray(equity_curve)
+    curve = np.asarray(curve)
     peak = np.maximum.accumulate(curve)
+
     drawdown = curve / peak - 1
 
     return {
@@ -418,9 +544,7 @@ def simulate(x, signal, start, end):
         "total_return": round(
             100 * (equity - 1), 3
         ),
-        "profit_factor": round(
-            profit_factor, 3
-        ),
+        "profit_factor": round(pf, 3),
         "max_drawdown": round(
             100 * float(drawdown.min()), 3
         ),
@@ -464,12 +588,6 @@ def passes_test(metrics):
 
 
 def strategy_research(x):
-    """Rank on training data; validate out of sample.
-
-    Returns:
-        selected, approved, results, signal_map
-    """
-
     signal_map = signals(x)
     n = len(x)
 
@@ -496,21 +614,19 @@ def strategy_research(x):
 
     ranked = sorted(
         results,
-        key=lambda name: results[name]["train_score"],
-        reverse=True,
+        key=lambda name:
+            results[name]["train_score"],
+        reverse=True
     )
 
-    # Prefer a training-qualified strategy that also
-    # passes the predeclared out-of-sample criteria.
-    # Do not optimize scores on the test set.
     selected = None
 
     for name in ranked:
-        result = results[name]
+        item = results[name]
 
         if (
-            result["train_score"] > -999999
-            and result["passed_test"]
+            item["train_score"] > -999999
+            and item["passed_test"]
         ):
             selected = name
             break
@@ -518,17 +634,19 @@ def strategy_research(x):
     approved = selected is not None
 
     if selected is None:
-        # Diagnostic only: the highest training score.
         selected = ranked[0] if ranked else None
 
     return selected, approved, results, signal_map
 
 
 def calculate(data, ticker=None, *args, **kwargs):
-    """Return scanner-compatible Arabic result fields."""
+    """Compatibility with existing market scanner."""
 
-    if isinstance(data, (str, int)) and isinstance(ticker, (pd.DataFrame, list, dict)):
+    if isinstance(data, (str, int)) and isinstance(
+        ticker, (pd.DataFrame, list, dict)
+    ):
         data, ticker = ticker, str(data)
+
     x = indicators(data)
 
     selected, approved, results, signal_map = (
@@ -544,25 +662,18 @@ def calculate(data, ticker=None, *args, **kwargs):
     relvol = float(last["relvol"])
     rsi = float(last["rsi"])
 
-    liquid = (
+    liquid = bool(
         np.isfinite(avgvalue)
         and avgvalue >= MIN_AVG_VALUE_SAR
     )
 
-    active_strategies = [
+    active = [
         name
         for name, signal in signal_map.items()
         if bool(signal.iloc[-1])
     ]
 
-    selected_active = (
-        selected in active_strategies
-    )
-
-    # Entry is conditional, not a live exchange quote.
-    entry = round(close, 2)
-    stop = round(entry * (1 - STOP_PCT), 2)
-    target = round(entry * (1 + TARGET_PCT), 2)
+    selected_active = selected in active
 
     valid = bool(
         approved
@@ -580,64 +691,61 @@ def calculate(data, ticker=None, *args, **kwargs):
         10 * int(liquid)
         + 10 * int(approved)
         + 10 * int(selected_active)
-        + 10 * int(relvol >= 1.1)
+        + 10 * int(relvol >= 1.10)
         + 10 * int(close > last["ema50"])
     )
 
-    date_value = x.index[-1]
-
-    if hasattr(date_value, "strftime"):
-        candle_date = date_value.strftime("%Y-%m-%d")
-    else:
-        candle_date = str(date_value)[:10]
+    entry = round(close, 2)
 
     if valid:
         reason = (
-            "Validated historical strategy; "
-            "current daily signal detected. "
-            "Live confirmation is still required."
+            "Historical validation passed; "
+            "live confirmation required."
         )
     elif not approved:
         reason = (
-            "No strategy passed the historical "
-            "out-of-sample requirements."
+            "No strategy passed out-of-sample tests."
         )
     elif not selected_active:
-        reason = (
-            "Validated strategy has no current signal."
-        )
+        reason = "No current strategy signal."
     elif not liquid:
-        reason = "Liquidity below required threshold."
+        reason = "Insufficient trading liquidity."
     else:
-        reason = "Entry conditions not fully satisfied."
+        reason = "Conditions not fully confirmed."
 
-    result = {
+    candle_date = x.index[-1].strftime(
+        "%Y-%m-%d"
+    )
+
+    return {
         "السهم": str(ticker or ""),
         "الرمز": str(ticker or ""),
         "التاريخ": candle_date,
         "تاريخ_الشمعة": candle_date,
-        "الحالة": (
-            "فرصة مشروطة" if valid else "لا دخول"
-        ),
+        "الحالة":
+            "فرصة مشروطة" if valid else "لا دخول",
         "الاستراتيجية": selected or "",
         "الاستراتيجية_الأفضل": selected or "",
-        "الاستراتيجيات_المتوافقة":
-            active_strategies,
-        "اجتاز_الاختبار_الخارجي": bool(approved),
+        "الاستراتيجيات_المتوافقة": active,
+        "اجتاز_الاختبار_الخارجي": approved,
         "نتائج_الاختبار": results,
         "نسبة_نجاح_تاريخية":
             selected_test.get("win_rate", 0),
         "عدد_صفقات_الاختبار":
             selected_test.get("trades", 0),
         "سبب_الإشارة": reason,
-        "السعر": round(close, 2),
-        "آخر_إغلاق": round(close, 2),
+        "السعر": entry,
+        "آخر_إغلاق": entry,
         "الدخول": entry,
         "سعر_الدخول": entry,
-        "وقف_الخسارة": stop,
-        "الوقف": stop,
-        "الهدف": target,
-        "هدف_الربح": target,
+        "وقف_الخسارة":
+            round(entry * (1 - STOP_PCT), 2),
+        "الوقف":
+            round(entry * (1 - STOP_PCT), 2),
+        "الهدف":
+            round(entry * (1 + TARGET_PCT), 2),
+        "هدف_الربح":
+            round(entry * (1 + TARGET_PCT), 2),
         "نسبة_الهدف": 2.0,
         "نسبة_الوقف": 1.0,
         "الكمية": None,
@@ -650,39 +758,32 @@ def calculate(data, ticker=None, *args, **kwargs):
         "الدعم": round(support, 2),
         "المقاومة": round(resistance, 2),
         "درجة_الجودة": score,
-        "قيمة_التداول_اليومية_المتوسطة_مليون": round(avgvalue / 1_000_000, 3),
+        "قيمة_التداول_اليومية_المتوسطة_مليون":
+            round(avgvalue / 1_000_000, 3),
         "التقييم": score,
         "الدرجة": score,
         "score": score,
     }
 
-    return result
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    for symbol in WATCHLIST[:3]:
-        try:
-            data = daily(symbol)
+    symbol = "1120"
 
-            if data is None:
-                print(symbol, "NO DATA")
-                continue
+    data = daily(symbol)
 
-            result = calculate(data, symbol)
+    if data is None:
+        raise RuntimeError(
+            "No sufficient historical data for " + symbol
+        )
 
-            print(
-                symbol,
-                result["الحالة"],
-                result["الاستراتيجية_الأفضل"],
-                result["عدد_صفقات_الاختبار"],
-                result["نسبة_نجاح_تاريخية"],
-            )
+    result = calculate(data, symbol)
 
-        except Exception as exc:
-            LOG.exception(
-                "Research failed for %s: %s",
-                symbol,
-                exc,
-            )
+    print("SYMBOL:", symbol)
+    print("CANDLES:", len(data))
+    print("FIRST:", data.index[0])
+    print("LAST:", data.index[-1])
+    print("LIQUIDITY:", result["السيولة"])
+    print("SCORE:", result["درجة_الجودة"])
+    print("STATUS:", result["الحالة"])

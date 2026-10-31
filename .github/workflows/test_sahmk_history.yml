@@ -1,0 +1,80 @@
+
+name: Test SAHMK Historical Data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-history:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Test historical endpoint
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          key = os.getenv("SAHMK_API_KEY", "").strip()
+
+          if not key:
+              raise RuntimeError(
+                  "SAHMK_API_KEY is missing"
+              )
+
+          url = (
+              "https://api.sahmk.sa/api/v1/"
+              "historical/1120/"
+          )
+
+          response = requests.get(
+              url,
+              headers={"X-API-Key": key},
+              params={"interval": "1d"},
+              timeout=30
+          )
+
+          print("HTTP STATUS:", response.status_code)
+          print("CONTENT TYPE:", response.headers.get("Content-Type"))
+
+          if response.ok:
+              data = response.json()
+              print("RESPONSE TYPE:", type(data).__name__)
+
+              if isinstance(data, dict):
+                  print("TOP LEVEL KEYS:", list(data.keys()))
+                  for name, value in data.items():
+                      print(
+                          "FIELD:",
+                          name,
+                          "| TYPE:",
+                          type(value).__name__,
+                          "| COUNT:",
+                          len(value)
+                          if isinstance(value, (list, dict))
+                          else "N/A"
+                      )
+              elif isinstance(data, list):
+                  print("CANDLE COUNT:", len(data))
+                  if data and isinstance(data[0], dict):
+                      print("CANDLE FIELDS:", list(data[0].keys()))
+          else:
+              print("REQUEST FAILED")
+              print("HTTP STATUS:", response.status_code)
+              print("RESPONSE PREVIEW:", response.text[:300])
+
+          response.raise_for_status()
+          PY

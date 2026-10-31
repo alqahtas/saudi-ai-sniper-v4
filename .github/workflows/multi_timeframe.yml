@@ -1,0 +1,39 @@
+
+name: Saudi AI Sniper - Multi Timeframe Analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  multi-timeframe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run multi-timeframe analysis
+        run: python multi_timeframe_engine.py 1120 2010 7010
+
+      - name: Upload analysis results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-timeframe-results
+          path: multi_timeframe_results.json
+          if-no-files-found: warn
+          retention-days: 14

@@ -20,7 +20,7 @@ jobs:
       - name: Install requests
         run: pip install requests
 
-      - name: Test historical endpoint
+      - name: Test 500 historical candles
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
         run: |
@@ -28,53 +28,38 @@ jobs:
           import os
           import requests
 
-          key = os.getenv("SAHMK_API_KEY", "").strip()
-
-          if not key:
-              raise RuntimeError(
-                  "SAHMK_API_KEY is missing"
-              )
-
-          url = (
-              "https://api.sahmk.sa/api/v1/"
-              "historical/1120/"
-          )
+          url = "https://api.sahmk.sa/api/v1/historical/1120/"
 
           response = requests.get(
               url,
-              headers={"X-API-Key": key},
-              params={"interval": "1d"},
-              timeout=30
+              headers={
+                  "X-API-Key": os.environ["SAHMK_API_KEY"]
+              },
+              params={
+                  "interval": "1d",
+                  "limit": 500
+              },
+              timeout=40
           )
 
           print("HTTP STATUS:", response.status_code)
-          print("CONTENT TYPE:", response.headers.get("Content-Type"))
-
-          if response.ok:
-              data = response.json()
-              print("RESPONSE TYPE:", type(data).__name__)
-
-              if isinstance(data, dict):
-                  print("TOP LEVEL KEYS:", list(data.keys()))
-                  for name, value in data.items():
-                      print(
-                          "FIELD:",
-                          name,
-                          "| TYPE:",
-                          type(value).__name__,
-                          "| COUNT:",
-                          len(value)
-                          if isinstance(value, (list, dict))
-                          else "N/A"
-                      )
-              elif isinstance(data, list):
-                  print("CANDLE COUNT:", len(data))
-                  if data and isinstance(data[0], dict):
-                      print("CANDLE FIELDS:", list(data[0].keys()))
-          else:
-              print("REQUEST FAILED")
-              print("HTTP STATUS:", response.status_code)
-              print("RESPONSE PREVIEW:", response.text[:300])
-
           response.raise_for_status()
+
+          payload = response.json()
+          candles = payload.get("data", [])
+
+          print("TOTAL AVAILABLE:", payload.get("total"))
+          print("CANDLES RECEIVED:", len(candles))
+          print("HAS MORE:", payload.get("has_more"))
+          print("LIMIT:", payload.get("limit"))
+
+          if candles:
+              print("CANDLE FIELDS:", list(candles[0].keys()))
+              print("FIRST CANDLE:", candles[0])
+              print("LAST CANDLE:", candles[-1])
+
+          if len(candles) >= 300:
+              print("SUCCESS: Enough candles for analysis")
+          else:
+              print("WARNING: Fewer than 300 candles")
           PY

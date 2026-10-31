@@ -1,5 +1,5 @@
 
-name: Test V8 Strategy Engine
+name: Test V8 Full Saudi Market
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  test-v8:
+  test-v8-full-market:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -27,48 +27,208 @@ jobs:
           pip install -r requirements.txt
           pip install requests pandas numpy
 
-      - name: Test V8 on three stocks
+      - name: Scan entire Saudi stock market
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
         run: |
-          python -u ai_strategy_engine.py 1120 2010 7010
+          python -u ai_strategy_engine.py
 
-      - name: Verify results
+      - name: Validate and summarize full market
         run: |
           python - <<'PY'
+          import csv
           import json
+          from collections import Counter
+          from pathlib import Path
 
-          with open("ai_strategy_results.json", encoding="utf-8") as f:
-              report = json.load(f)
+          path = Path("ai_strategy_results.json")
 
-          stocks = report["stocks"]
+          if not path.exists():
+              raise RuntimeError(
+                  "V8 results file was not created"
+              )
 
-          for symbol in ("1120", "2010", "7010"):
-              result = stocks.get(symbol, {})
-              status = result.get("status")
-              print(symbol, status)
+          report = json.loads(
+              path.read_text(encoding="utf-8")
+          )
 
-              if status != "ok":
-                  raise RuntimeError(
-                      f"{symbol} failed: {result}"
+          stocks = report.get("stocks", {})
+          universe_size = report.get(
+              "universe_size", 0
+          )
+
+          if universe_size == 0 or not stocks:
+              raise RuntimeError(
+                  "No Saudi stocks returned"
+              )
+
+          counts = Counter(
+              stock.get("status", "unknown")
+              for stock in stocks.values()
+          )
+
+          successful = counts.get("ok", 0)
+          errors = counts.get("error", 0)
+          insufficient = counts.get(
+              "insufficient_history", 0
+          )
+
+          approved = []
+          active = []
+          rows = []
+
+          for symbol, stock in stocks.items():
+              technical = stock.get(
+                  "technical") or {}
+              short = stock.get(
+                  "short_term") or {}
+
+              strategies = stock.get(
+                  "strategy_comparison") or {}
+
+              selected = short.get(
+                  "selected_strategy")
+
+              is_approved = bool(
+                  short.get(
+                      "approved_out_of_sample"
                   )
+              )
 
-              strategies = result.get("strategy_comparison", {})
-              print("Strategies:", len(strategies))
-
-              if len(strategies) != 5:
-                  raise RuntimeError(
-                      f"{symbol}: expected five strategies"
+              is_active = bool(
+                  short.get(
+                      "current_daily_signal"
                   )
+              )
 
-          print("V8 STRATEGY TEST PASSED")
+              if is_approved:
+                  approved.append(symbol)
+
+              if is_active:
+                  active.append(symbol)
+
+              rows.append({
+                  "symbol": symbol,
+                  "status": stock.get("status"),
+                  "classification": stock.get(
+                      "classification"),
+                  "last_close": technical.get(
+                      "last_close"),
+                  "avg_value_sar": technical.get(
+                      "average_traded_value_sar"),
+                  "rsi": technical.get("rsi"),
+                  "relative_volume": technical.get(
+                      "relative_volume"),
+                  "selected_strategy": selected,
+                  "approved": is_approved,
+                  "active_signal": is_active,
+                  "test_trades": short.get(
+                      "test_trades"),
+                  "test_win_rate_pct": short.get(
+                      "test_win_rate_pct"),
+                  "strategies_tested": len(
+                      strategies),
+                  "error": stock.get("error"),
+              })
+
+          fields = [
+              "symbol",
+              "status",
+              "classification",
+              "last_close",
+              "avg_value_sar",
+              "rsi",
+              "relative_volume",
+              "selected_strategy",
+              "approved",
+              "active_signal",
+              "test_trades",
+              "test_win_rate_pct",
+              "strategies_tested",
+              "error",
+          ]
+
+          with open(
+              "v8_full_market_summary.csv",
+              "w",
+              newline="",
+              encoding="utf-8-sig",
+          ) as f:
+              writer = csv.DictWriter(
+                  f, fieldnames=fields
+              )
+              writer.writeheader()
+              writer.writerows(rows)
+
+          summary = {
+              "universe_size": universe_size,
+              "reported_stocks": len(stocks),
+              "analyzed": successful,
+              "errors": errors,
+              "insufficient_history": insufficient,
+              "other_statuses": {
+                  k: v
+                  for k, v in counts.items()
+                  if k not in (
+                      "ok",
+                      "error",
+                      "insufficient_history",
+                  )
+              },
+              "approved_strategies": len(approved),
+              "active_signals": len(active),
+              "approved_symbols": approved,
+              "active_symbols": active,
+          }
+
+          Path(
+              "v8_full_market_summary.json"
+          ).write_text(
+              json.dumps(
+                  summary,
+                  ensure_ascii=False,
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          print("\n===== V8 FULL MARKET =====")
+          print(
+              json.dumps(
+                  summary,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+          )
+
+          if len(stocks) != universe_size:
+              raise RuntimeError(
+                  "Universe count mismatch"
+              )
+
+          if successful == 0:
+              raise RuntimeError(
+                  "No stocks successfully analyzed"
+              )
+
+          if successful < universe_size * 0.90:
+              raise RuntimeError(
+                  "Less than 90% of stocks analyzed"
+              )
+
+          print(
+              "V8 FULL MARKET TEST PASSED"
+          )
           PY
 
-      - name: Upload results
+      - name: Upload full market reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v8-strategy-test-results
-          path: ai_strategy_results.json
+          name: v8-full-saudi-market-results
+          path: |
+            ai_strategy_results.json
+            v8_full_market_summary.json
+            v8_full_market_summary.csv
           if-no-files-found: warn
           retention-days: 14

@@ -1,0 +1,103 @@
+
+name: V8 Full Market Walk Forward Lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-market-lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install requests pandas numpy
+
+      - name: Run full Saudi market research
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: |
+          python -u v8_market_lab.py
+
+      - name: Validate results
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("v8_market_lab_results.json")
+
+          if not path.exists():
+              raise RuntimeError("Missing results file")
+
+          report = json.loads(
+              path.read_text(encoding="utf-8")
+          )
+
+          stocks = report.get("stocks", {})
+          total = report.get("universe_size", 0)
+
+          analyzed = sum(
+              s.get("status") == "ok"
+              for s in stocks.values()
+          )
+
+          errors = sum(
+              s.get("status") == "error"
+              for s in stocks.values()
+          )
+
+          insufficient = sum(
+              s.get("status") == "insufficient_history"
+              for s in stocks.values()
+          )
+
+          qualified = sum(
+              (s.get("summary") or {}).get(
+                  "sufficient_folds", False
+              )
+              for s in stocks.values()
+          )
+
+          print("TOTAL STOCKS:", total)
+          print("ANALYZED:", analyzed)
+          print("ERRORS:", errors)
+          print("INSUFFICIENT HISTORY:", insufficient)
+          print("QUALIFIED FOLDS:", qualified)
+
+          if total == 0:
+              raise RuntimeError("No market stocks")
+
+          if len(stocks) != total:
+              raise RuntimeError("Universe mismatch")
+
+          if analyzed == 0:
+              raise RuntimeError("No stocks analyzed")
+
+          print("V8 FULL MARKET LAB PASSED")
+          PY
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-market-lab-results
+          path: |
+            v8_market_lab_results.json
+            v8_market_lab_summary.csv
+          if-no-files-found: warn
+          retention-days: 14

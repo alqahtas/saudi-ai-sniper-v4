@@ -17,59 +17,47 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requests
-        run: pip install requests
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
 
-      - name: Test historical date range
+      - name: Test Sniper Core on Al Rajhi
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
         run: |
-          python - <<'PY'
-          import os
-          import requests
+          python -u - <<'PY'
+          from sniper_core import daily, calculate
 
-          url = "https://api.sahmk.sa/api/v1/historical/1120/"
+          symbol = "1120"
 
-          params = {
-              "interval": "1d",
-              "from": "2024-01-01",
-              "to": "2026-10-30",
-              "limit": 500,
-              "offset": 0
-          }
+          print("Testing SAHMK historical data...")
+          data = daily(symbol)
 
-          response = requests.get(
-              url,
-              headers={
-                  "X-API-Key": os.environ["SAHMK_API_KEY"]
-              },
-              params=params,
-              timeout=40
+          if data is None:
+              raise RuntimeError(
+                  "SAHMK returned insufficient data"
+              )
+
+          print("CANDLES:", len(data))
+          print("FIRST DATE:", data.index[0])
+          print("LAST DATE:", data.index[-1])
+
+          if len(data) < 300:
+              raise RuntimeError(
+                  "Fewer than 300 daily candles"
+              )
+
+          result = calculate(data, symbol)
+
+          print("SYMBOL:", result.get("السهم"))
+          print("LIQUIDITY SAR:", result.get("السيولة"))
+          print("SCORE:", result.get("درجة_الجودة"))
+          print("STATUS:", result.get("الحالة"))
+          print(
+              "BACKTEST TRADES:",
+              result.get("عدد_صفقات_الاختبار")
           )
 
-          print("HTTP STATUS:", response.status_code)
-          response.raise_for_status()
-
-          payload = response.json()
-
-          candles = payload.get("data", [])
-
-          print("SYMBOL:", payload.get("symbol"))
-          print("FROM:", payload.get("from"))
-          print("TO:", payload.get("to"))
-          print("TOTAL AVAILABLE:", payload.get("total"))
-          print("CANDLES RECEIVED:", len(candles))
-          print("HAS MORE:", payload.get("has_more"))
-          print("LIMIT:", payload.get("limit"))
-
-          if candles:
-              print("FIRST DATE:", candles[0].get("date"))
-              print("LAST DATE:", candles[-1].get("date"))
-              print("CANDLE FIELDS:", list(candles[0].keys()))
-
-          if len(candles) >= 300:
-              print("SUCCESS: ENOUGH HISTORICAL DATA")
-          else:
-              print("WARNING: INSUFFICIENT HISTORICAL DATA")
-
+          print("SNIPER CORE TEST PASSED")
           PY

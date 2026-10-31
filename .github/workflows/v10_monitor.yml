@@ -6,11 +6,12 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   scan-market:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -27,31 +28,57 @@ jobs:
           pip install -r requirements.txt
           pip install pandas numpy requests
 
-      - name: Check V10 files
+      - name: Check Python code
         run: |
           python -m py_compile v10_live_monitor.py
-          if [ -f v10_watchlist.json ]; then
-            echo "V10 watchlist exists"
-          else
-            echo "::error::v10_watchlist.json is missing"
-            echo "The historical scan artifact must be restored."
+          echo "Python code OK"
+
+      - name: Restore previous V10 watchlist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -s v10_watchlist.json ]; then
+            echo "Watchlist already exists"
+            exit 0
+          fi
+
+          echo "Searching previous GitHub artifacts..."
+
+          ARTIFACT_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name == "v10-market-watchlist" and .expired == false)] | sort_by(.created_at) | reverse | .[0].id // empty')
+
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "::error::No previous V10 watchlist artifact found"
             exit 1
           fi
+
+          echo "Found artifact ID: $ARTIFACT_ID"
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > /tmp/v10_watchlist.zip
+
+          unzip -o /tmp/v10_watchlist.zip -d .
+
+          if [ ! -s v10_watchlist.json ]; then
+            echo "::error::Watchlist JSON not found in artifact"
+            exit 1
+          fi
+
+          python -m json.tool v10_watchlist.json > /dev/null
+          echo "Watchlist restored successfully"
 
       - name: Test SAHMK Pro connection
         env:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
-          SAHMK_BASE_URL: ${{ vars.SAHMK_BASE_URL }}
         run: |
           python -u v10_live_monitor.py --check
 
-      - name: Upload V10 diagnostic files
+      - name: Upload diagnostic watchlist
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: v10-diagnostics
-          path: |
-            v10_watchlist.json
-            v10_monitor_state.json
-            v10_events.json
+          path: v10_watchlist.json
           if-no-files-found: ignore

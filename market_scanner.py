@@ -215,7 +215,7 @@ def scan_universe(symbols, max_candidates=50):
                 stats["missing_history"] += 1
                 failures.append(symbol)
                 continue
-            result = calculate(symbol, candles)
+            result = calculate(candles, symbol)
             if not isinstance(result, dict):
                 stats["analysis_failed"] += 1
                 failures.append(symbol)

@@ -106,14 +106,14 @@ def track_targets(symbol, price, token, chat_id):
             return
         # A single quote may jump directly above both targets. Mark both as reached.
         gain = (price / entry - 1) * 100
-        msg = (f'🇸🇦 Saudi AI Sniper | تحديث متابعة\\n{label}\\n'
-               f'السهم: {trade.get("name", symbol)} ({symbol})\\n'
-               f'السعر المرصود: {price:.3f} ريال\\n'
-               f'الدخول المرجعي: {entry:.3f} ريال\\n'
-               f'التغير النظري عند السعر المرصود: {gain:+.2f}%\\n'
-               f'الهدف الأول: {target1:.3f} | الهدف الثاني: {target2:.3f}\\n'
-               f'وقف الخسارة الأصلي: {stop:.3f}\\n'
-               f'الحالة: {"مستمر للهدف الثاني" if new_status == "target1" else "انتهت المتابعة"}\\n'
+        msg = (f'🇸🇦 Saudi AI Sniper | تحديث متابعة\n{label}\n'
+               f'السهم: {trade.get("name", symbol)} ({symbol})\n'
+               f'السعر المرصود: {price:.3f} ريال\n'
+               f'الدخول المرجعي: {entry:.3f} ريال\n'
+               f'التغير النظري عند السعر المرصود: {gain:+.2f}%\n'
+               f'الهدف الأول: {target1:.3f} | الهدف الثاني: {target2:.3f}\n'
+               f'وقف الخسارة الأصلي: {stop:.3f}\n'
+               f'الحالة: {"مستمر للهدف الثاني" if new_status == "target1" else "انتهت المتابعة"}\n'
                '⚠️ لا يوجد تنفيذ بيع تلقائي؛ الأسعار المرصودة لا تضمن تنفيذًا.')
         if notify(token, chat_id, msg):
             trade['status'] = new_status

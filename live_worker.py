@@ -296,7 +296,11 @@ def main():
             ws.settimeout(10)
             subscribed = False
             started = time.monotonic()
+            last_ping = started
             while market_open(datetime.now(TZ)) and time.monotonic() - started <= 300:
+                if time.monotonic() - last_ping >= 30:
+                    ws.send(json.dumps({'action': 'ping'}))
+                    last_ping = time.monotonic()
                 try:
                     raw = ws.recv()
                 except WebSocketTimeoutException:
@@ -313,7 +317,10 @@ def main():
                     subscribed = True
                     LOG.info('Subscribed to %d symbols (provider limits respected)', count)
                 elif event == 'error':
-                    raise RuntimeError('WebSocket server error: ' + str(message.get('code', 'unknown')))
+                    code = str(message.get('code') or 'unknown')
+                    if code.startswith('MARKET_DATA_ENTITLEMENT') or code in ('WS_AUTH_OR_ACCESS',):
+                        raise PermissionError('WebSocket access denied: ' + code)
+                    raise RuntimeError('WebSocket server error: ' + code)
                 elif event == 'quote':
                     try:
                         on_quote(message, token, chat_id)
@@ -323,6 +330,10 @@ def main():
                 recovered(token, chat_id, 'اتصال الأسعار اللحظية')
             else:
                 raise RuntimeError('WebSocket did not confirm connection/subscription')
+        except PermissionError as exc:
+            LOG.error('WebSocket authorization denied; stop retries: %s', exc)
+            issue(token, chat_id, 'صلاحية بيانات الأسعار اللحظية', exc)
+            return
         except Exception as exc:
             LOG.exception('WebSocket connection failed')
             issue(token, chat_id, 'اتصال الأسعار اللحظية', exc)

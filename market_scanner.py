@@ -1,339 +1,342 @@
-"""Saudi AI Sniper V5.3 — activity-filtered historical TASI scanner.
-Read-only; no orders or live-entry confirmation.
+"""Saudi AI Sniper — live watcher (read-only).
+Historical setups are previews, never live buy recommendations.
 """
 import json
 import logging
 import os
-from collections import Counter
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, time as clock_time
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-import requests
+from websocket import WebSocketTimeoutException, create_connection
+from market_scanner import run
+from sahmk_pro import tasi_market
+from telegram_scan import send_telegram, strategy_label
 
-BASE_URL = "https://api.sahmk.sa/api/v1"
-TZ = ZoneInfo("Asia/Riyadh")
-LOG = logging.getLogger(__name__)
-MIN_LIQUIDITY_M_SAR = 20.0
-UNIVERSE_LIMIT = max(1, int(os.getenv("SCAN_UNIVERSE_LIMIT", "1000")))
+TZ = ZoneInfo('Asia/Riyadh')
+LOG = logging.getLogger('sniper-live')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+WS_URL = 'wss://api.sahmk.sa/ws/v1/stocks/?api_key='
+REFRESH_SECONDS = max(900, int(os.getenv('SETUP_REFRESH_SECONDS', '1800')))
+MARKET_REFRESH_SECONDS = 180
+STATE = Path('live_alert_state.json')
+lock = threading.RLock()
+watchlist = {}
+market = None
+last_prices = {}
+sent = set()
+failures = set()
 
 
-def fix_text(value):
-    if not isinstance(value, str) or not any(x in value for x in ("Ø", "Ù")):
-        return value
+def market_open(now):
+    return now.weekday() in (6, 0, 1, 2, 3) and clock_time(10) <= now.time() < clock_time(15)
+
+
+def number(value):
     try:
-        return value.encode("latin-1").decode("utf-8")
-    except UnicodeError:
-        return value
+        x = float(value)
+        return x if 0 < x < float('inf') else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
-def normalize_row(row):
-    if not isinstance(row, dict):
-        return row
-    return {fix_text(k): fix_text(v) for k, v in row.items()}
+def load_sent():
+    try:
+        data = json.loads(STATE.read_text(encoding='utf-8'))
+        return set(map(str, data)) if isinstance(data, list) else set()
+    except (OSError, ValueError):
+        return set()
 
 
-def sahmk_session():
-    key = os.getenv("SAHMK_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("SAHMK_API_KEY is missing")
-    session = requests.Session()
-    session.headers.update({"X-API-Key": key})
-    return session
+def save_sent():
+    try:
+        temp = STATE.with_suffix('.tmp')
+        temp.write_text(json.dumps(sorted(sent), ensure_ascii=False), encoding='utf-8')
+        temp.replace(STATE)
+    except OSError:
+        LOG.exception('Cannot save alert state')
 
 
-def tasi_equities(session=None):
-    session = session or sahmk_session()
-    symbols = {}
-    offset = 0
-    for _ in range(10):
-        response = session.get(
-            f"{BASE_URL}/companies/",
-            params={"market": "TASI", "limit": 500, "offset": offset},
-            timeout=25,
+def notify(token, chat_id, message):
+    try:
+        return send_telegram(token, chat_id, message) is not False
+    except Exception:
+        LOG.exception('Telegram delivery failed')
+        return False
+
+
+def issue(token, chat_id, category, exc):
+    with lock:
+        if category in failures:
+            return
+        failures.add(category)
+    LOG.warning('%s failed: %s', category, exc)
+    notify(token, chat_id, f'⚠️ Saudi AI Sniper | تعطل {category}\n{type(exc).__name__}: {str(exc)[:130]}')
+
+
+def recovered(token, chat_id, category):
+    with lock:
+        if category not in failures:
+            return
+        failures.remove(category)
+    notify(token, chat_id, f'✅ Saudi AI Sniper | عاد {category} للعمل.')
+
+
+def market_status():
+    data = tasi_market()
+    if not isinstance(data, dict) or data.get('is_delayed') is not False:
+        raise ValueError('TASI data not confirmed real-time')
+    if any(data.get(k) is None for k in ('index_change_percent', 'advancing', 'declining')):
+        raise ValueError('TASI breadth fields missing')
+    change = float(data['index_change_percent'])
+    advancing = int(data['advancing'])
+    declining = int(data['declining'])
+    if advancing + declining <= 0:
+        raise ValueError('TASI breadth empty')
+    return {'positive': change > 0 and advancing > 1.4 * declining, 'change': change}
+
+
+def prepare(report):
+    """Watch liquid ranked stocks; keep entry criteria separate from monitoring."""
+    rows = report.get('historical_candidates') or []
+    if not isinstance(rows, list):
+        raise ValueError('Invalid historical_candidates')
+    prepared = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get('السهم') or '').strip()
+        if not symbol.isdigit():
+            continue
+        # Monitoring is independent of liquidity qualification.
+        # Missing liquidity is NOT permission to issue an entry alert.
+        prepared[symbol] = row
+    return prepared
+
+
+def valid_setup(row):
+    if row.get('تصنيف_الماسح') != 'فرصة مشروطة' or row.get('مستوفي_شرط_السيولة') is not True:
+        return False
+    entry = number(row.get('بداية_نطاق_الشراء'))
+    stop = number(row.get('وقف_تقديري'))
+    if entry is None or stop is None or stop >= entry:
+        return False
+    try:
+        candle_date = datetime.fromisoformat(str(row.get('التاريخ') or '')[:10]).date()
+    except ValueError:
+        return False
+    weekly = str(row.get('الإطار_الزمني') or '').lower() in ('weekly', '1w', 'أسبوعي')
+    age = (datetime.now(TZ).date() - candle_date).days
+    return 0 <= age <= (10 if weekly else 5)
+
+
+def send_previews(rows, token, chat_id):
+    for symbol, row in list(rows.items()):
+        if not valid_setup(row):
+            continue
+        strategy = str(row.get('الاستراتيجيات') or '')
+        candle = str(row.get('التاريخ') or '')[:10]
+        unique = f'PREVIEW|{symbol}|{strategy}|{candle}'
+        with lock:
+            if unique in sent:
+                continue
+        message = (
+            '🇸🇦 Saudi AI Sniper | فرصة مراقبة تاريخية\n\n'
+            f'{strategy_label(strategy)}\n'
+            f"السهم: {row.get('اسم_الشركة', symbol)} ({symbol})\n"
+            f"مستوى التفعيل: {row.get('بداية_نطاق_الشراء')} ريال\n"
+            f"وقف تقديري: {row.get('وقف_تقديري')} ريال\n"
+            f"الهدف الأول: {row.get('هدف_تقديري')} ريال\n"
+            f'تاريخ الشمعة: {candle}\n\n'
+            '⚠️ تحليل تاريخي فقط، ليس تأكيد دخول لحظي.'
         )
-        response.raise_for_status()
-        payload = response.json()
-        rows = payload.get("results") if isinstance(payload, dict) else None
-        if not isinstance(rows, list):
-            raise RuntimeError("Invalid SAHMK companies response")
-        for company in rows:
-            if not isinstance(company, dict):
-                continue
-            symbol = str(company.get("symbol", "")).strip()
-            if (
-                company.get("market") == "TASI"
-                and str(company.get("status", "")).lower() == "active"
-                and str(company.get("security_type", "")).lower() == "equity"
-                and company.get("is_etf") is not True
-                and symbol.isdigit()
-            ):
-                symbols[symbol] = company.get("name_ar") or company.get("name_en") or symbol
-        offset += len(rows)
-        total = payload.get("total")
-        if not rows or (isinstance(total, int) and offset >= total) or len(rows) < 500:
-            break
-    else:
-        raise RuntimeError("Companies directory exceeded 10 pages")
-    if not symbols:
-        raise RuntimeError("No active TASI equities found")
-    return symbols
+        if notify(token, chat_id, message):
+            with lock:
+                sent.add(unique)
+                save_sent()
 
 
-def select_active_equities(symbols, session=None, limit=UNIVERSE_LIMIT):
-    """Select liquid/activity leaders, not a historical top-100 ranking.
-
-    SAHMK leader endpoints each allow up to 50 names. Combine value leaders
-    with volume leaders; avoid silently substituting arbitrary directory order.
-    """
-    session = session or sahmk_session()
-    selected = {}
-    for endpoint in ("value", "volume"):
-        try:
-            response = session.get(
-                f"{BASE_URL}/market/{endpoint}/",
-                params={"index": "TASI", "limit": 50},
-                timeout=25,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            rows = payload.get("stocks") if isinstance(payload, dict) else None
-            if not isinstance(rows, list):
-                raise ValueError("Invalid market leaders response")
-            for item in rows:
-                if not isinstance(item, dict):
-                    continue
-                symbol = str(item.get("symbol", "")).strip()
-                if symbol in symbols:
-                    selected[symbol] = symbols[symbol]
-                if len(selected) >= limit:
-                    break
-            LOG.info("ACTIVITY %s: received=%d selected=%d", endpoint, len(rows), len(selected))
-        except (requests.RequestException, ValueError) as exc:
-            LOG.warning("ACTIVITY %s unavailable: %s", endpoint, exc)
-        if len(selected) >= limit:
-            break
-    if not selected:
-        raise RuntimeError("No verified activity leaders available; refusing arbitrary stock selection")
-    if len(selected) < limit:
-        LOG.warning("Only %d unique active symbols found (target=%d)", len(selected), limit)
-    return dict(list(selected.items())[:limit])
-
-
-def normalized_daily(candles):
-    import pandas as pd
-    if candles is None or candles.empty:
-        return None
-    df = candles.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        return None
-    if not isinstance(df.index, pd.DatetimeIndex):
-        date_col = next((c for c in df.columns if str(c).lower() in ("date", "datetime", "timestamp")), None)
-        if date_col is None:
-            return None
-        df.index = pd.to_datetime(df[date_col], errors="coerce", utc=True).dt.tz_localize(None)
-    elif df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    names = {str(c).lower(): c for c in df.columns}
-    required = ("open", "high", "low", "close", "volume")
-    if not all(name in names for name in required):
-        return None
-    df = df[[names[name] for name in required]].copy()
-    df.columns = list(required)
-    for name in required:
-        df[name] = pd.to_numeric(df[name], errors="coerce")
-    df = df.dropna().sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df if not df.empty else None
-
-
-def weekly_setup(symbol, company, daily_candles, liquidity):
-    import pandas as pd
-    df = normalized_daily(daily_candles)
-    if df is None or len(df) < 160 or liquidity < MIN_LIQUIDITY_M_SAR:
-        return None
-    weekly = df.resample("W-THU", label="right", closed="right").agg({
-        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
-    }).dropna()
-    now = datetime.now(TZ)
-    today = pd.Timestamp(now.date())
-    weekly = weekly.loc[weekly.index <= today]
-    if now.weekday() == 3 and (now.hour, now.minute) < (15, 0):
-        weekly = weekly.loc[weekly.index < today]
-    if len(weekly) < 30:
-        return None
-    close, volume = weekly["close"], weekly["volume"]
-    ma10, ma20 = close.rolling(10).mean(), close.rolling(20).mean()
-    vol10 = volume.shift(1).rolling(10).mean()
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    rsi = 100 - 100 / (1 + gain / loss.replace(0, float("nan")))
-    support = weekly["low"].shift(1).rolling(12).min()
-    latest = weekly.iloc[-1]
-    price, base = float(latest["close"]), float(support.iloc[-1])
-    if price <= 0 or base <= 0 or pd.isna(vol10.iloc[-1]):
-        return None
-    conditions = (
-        price > float(ma10.iloc[-1]) > float(ma20.iloc[-1]),
-        float(ma10.iloc[-1]) > float(ma10.iloc[-2]),
-        50 <= float(rsi.iloc[-1]) <= 70,
-        base <= price <= base * 1.08,
-        float(latest["volume"]) >= float(vol10.iloc[-1]) * 1.20,
-    )
-    if not all(conditions):
-        return None
-    stop = round(base * .98, 2)
-    risk = price - stop
-    if risk <= 0:
-        return None
-    return {
-        "السهم": symbol, "اسم_الشركة": company,
-        "الإطار_الزمني": "weekly", "الاستراتيجيات": "weekly_support",
-        "الحالة": "فرصة مشروطة", "تصنيف_الماسح": "فرصة مشروطة",
-        "درجة_الجودة": 80, "بداية_نطاق_الشراء": round(price, 2),
-        "وقف_تقديري": stop, "هدف_تقديري": round(price + 1.5 * risk, 2),
-        "هدف_ثان": round(price + 2.5 * risk, 2),
-        "التاريخ": weekly.index[-1].date().isoformat(),
-        "قيمة_التداول_اليومية_المتوسطة_مليون": liquidity,
-        "مستوفي_شرط_السيولة": True,
-        "سبب_الإشارة": "اتجاه أسبوعي صاعد + RSI + قرب دعم + حجم أسبوعي مرتفع",
-        "نوع_البيانات": "شموع أسبوعية مكتملة، ليست أسعارًا لحظية",
-    }
-
-
-def scan_universe(symbols, max_candidates=50):
-    from sniper_core import daily, calculate
-    stats = Counter()
-    failures, scored, weeklies = [], [], []
-    total = len(symbols)
-    LOG.info("SCAN START: %d selected TASI equities", total)
-    for index, (symbol, company) in enumerate(symbols.items(), 1):
-        try:
-            candles = daily(symbol)
-            if candles is None or candles.empty:
-                stats["missing_history"] += 1
-                failures.append(symbol)
-                continue
-            result = calculate(candles, symbol)
-            if not isinstance(result, dict):
-                stats["analysis_failed"] += 1
-                failures.append(symbol)
-                continue
-            stats["analyzed"] += 1
-            item = normalize_row(dict(result))
-            item["اسم_الشركة"] = company
-            score = float(item.get("درجة_الجودة") or 0)
-            liquidity = float(item.get("قيمة_التداول_اليومية_المتوسطة_مليون") or 0)
-            liquid = liquidity >= MIN_LIQUIDITY_M_SAR
-            stats["liquid" if liquid else "below_liquidity_threshold"] += 1
-            validated = liquid and item.get("الحالة") == "فرصة مشروطة"
-            if validated:
-                stats["validated_setups"] += 1
-            item["تصنيف_الماسح"] = "فرصة مشروطة" if validated else "مراقبة فقط"
-            item["مستوفي_شرط_السيولة"] = liquid
-            item.setdefault("الإطار_الزمني", "daily")
-            scored.append((validated, liquid, score, liquidity, item))
+def refresh_loop(token, chat_id):
+    global watchlist, market
+    last_scan = 0
+    last_market = 0
+    last_heartbeat = 0
+    last_report_day = None
+    while True:
+        now = time.monotonic()
+        local = datetime.now(TZ)
+        session = market_open(local)
+        if now - last_heartbeat >= 60:
+            with lock:
+                count = len(watchlist)
+                qualified = sum(valid_setup(row) for row in watchlist.values())
+            LOG.info('HEARTBEAT alive; market_open=%s; watched=%d; qualified=%d', session, count, qualified)
+            last_heartbeat = now
+        if now - last_scan >= REFRESH_SECONDS:
+            last_scan = now
+            started = time.monotonic()
+            LOG.info('SCAN START: fetching TASI history')
             try:
-                weekly = weekly_setup(symbol, company, candles, liquidity)
-                if weekly:
-                    weeklies.append(weekly)
-                    stats["weekly_setups"] += 1
+                report = run(max_candidates=50, quote_budget=0)
+                fresh = prepare(report)
+                stats = report.get('summary') or {}
+                # Preserve a working watchlist if a later scan returns zero unexpectedly.
+                with lock:
+                    if fresh:
+                        watchlist = fresh
+                    current_count = len(watchlist)
+                LOG.info('SCAN DONE: universe=%s analyzed=%s failed=%s watched=%d liquid_in_top=%d liquid_in_universe=%d below_liquidity=%d qualified=%d duration=%ss',
+                         report.get('universe_size', 0), stats.get('analyzed', 0),
+                         stats.get('failed_total', 0), current_count,
+                         sum(row.get('مستوفي_شرط_السيولة') is True for row in fresh.values()),
+                         stats.get('liquid', 0), stats.get('below_liquidity_threshold', 0),
+                         sum(valid_setup(row) for row in fresh.values()), int(time.monotonic() - started))
+                if not fresh:
+                    raise RuntimeError('Scanner returned no historical candidates; inspect scanner output')
+                recovered(token, chat_id, 'الفحص التاريخي')
+                send_previews(fresh, token, chat_id)
             except Exception as exc:
-                stats["weekly_errors"] += 1
-                LOG.warning("Weekly analysis %s: %s: %s", symbol, type(exc).__name__, exc)
-        except Exception as exc:
-            stats["exceptions"] += 1
-            failures.append(symbol)
-            LOG.warning("Stock %s: %s: %s", symbol, type(exc).__name__, str(exc)[:150])
-        finally:
-            if index == 1 or index % 10 == 0 or index == total:
-                LOG.info("SCAN PROGRESS: %d/%d analyzed=%d failures=%d", index, total, stats["analyzed"], len(failures))
-    scored.sort(key=lambda row: row[:4], reverse=True)
-    top = [row[4] for row in scored[:max(0, int(max_candidates))]]
-    weeklies.sort(key=lambda item: item["درجة_الجودة"], reverse=True)
-    stats.update(
-        universe_size=total, failed_total=len(failures),
-        watchlist_returned=len(top),
-        watchlist_liquid=sum(bool(item["مستوفي_شرط_السيولة"]) for item in top),
+                LOG.exception('SCAN FAILED')
+                issue(token, chat_id, 'الفحص التاريخي', exc)
+        if session and now - last_market >= MARKET_REFRESH_SECONDS:
+            last_market = now
+            try:
+                fresh_market = market_status()
+                with lock:
+                    market = fresh_market
+                LOG.info('TASI change=%+.2f%% positive=%s', fresh_market['change'], fresh_market['positive'])
+                recovered(token, chat_id, 'بيانات تاسي اللحظية')
+            except Exception as exc:
+                with lock:
+                    market = None
+                issue(token, chat_id, 'بيانات تاسي اللحظية', exc)
+        if session and last_report_day != local.date() and local.time() >= clock_time(10, 15):
+            with lock:
+                count = len(watchlist)
+                qualified = sum(valid_setup(row) for row in watchlist.values())
+                liquid_count = sum(row.get('مستوفي_شرط_السيولة') is True for row in watchlist.values())
+                m = market
+            if notify(token, chat_id, f'📊 Saudi AI Sniper | تقرير المراقبة\nالأسهم المرشحة للمتابعة: {count}\nمستوفية للسيولة: {liquid_count}\nفرص تاريخية مستوفية: {qualified}\nفلتر تاسي إيجابي: {"نعم" if m and m["positive"] else "لا / غير متاح"}\n⚠️ عدد المراقبة ليس عدد إشارات الدخول.'):
+                last_report_day = local.date()
+        if not session:
+            with lock:
+                market = None
+        time.sleep(5)
+
+
+def on_quote(message, token, chat_id):
+    if message.get('type') != 'quote':
+        return
+    data = message.get('data') or {}
+    if not isinstance(data, dict) or data.get('is_delayed') is not False:
+        return
+    symbol = str(message.get('symbol') or data.get('symbol') or '').strip()
+    price = number(data.get('price') or data.get('last_price') or message.get('price'))
+    if not symbol or price is None or not market_open(datetime.now(TZ)):
+        return
+    with lock:
+        row = watchlist.get(symbol)
+        current_market = market
+        previous = last_prices.get(symbol)
+        last_prices[symbol] = price
+    if row is None or not valid_setup(row):
+        return
+    entry = number(row.get('بداية_نطاق_الشراء'))
+    if not current_market or not current_market['positive'] or entry is None or previous is None:
+        return
+    if not (previous < entry <= price):
+        return
+    strategy = str(row.get('الاستراتيجيات') or '')
+    candle = str(row.get('التاريخ') or '')[:10]
+    unique = f'LIVE|{symbol}|{strategy}|{candle}'
+    with lock:
+        if unique in sent:
+            return
+    message_text = (
+        '🇸🇦 Saudi AI Sniper | 🚨 عبور سعري لحظي\n\n'
+        f'{strategy_label(strategy)}\n'
+        f"السهم: {row.get('اسم_الشركة', symbol)} ({symbol})\n"
+        f'السعر المستلم: {price:.3f} ريال\n'
+        f'مستوى التفعيل: {entry:.3f} ريال\n'
+        f"وقف تقديري: {row.get('وقف_تقديري')} ريال\n"
+        f"الهدف الأول: {row.get('هدف_تقديري')} ريال\n"
+        f"الهدف الثاني: {row.get('هدف_ثان')} ريال\n"
+        f"تاسي: {current_market['change']:+.2f}%\n\n"
+        '⚠️ عبور سعر فقط؛ تحقق من السيولة وعمق السوق قبل القرار.'
     )
-    return top, weeklies, failures, dict(stats)
+    if notify(token, chat_id, message_text):
+        with lock:
+            sent.add(unique)
+            save_sent()
+        LOG.info('LIVE ALERT SENT: %s %.3f', symbol, price)
 
 
-def rank_universe(symbols, max_candidates=50):
-    ranked, _, failed, _ = scan_universe(symbols, max_candidates)
-    return ranked, failed
-
-
-def verify_quotes(candidates, session=None, budget=0):
-    budget = max(0, min(int(budget), 20))
-    if budget == 0:
-        return {}
-    session = session or sahmk_session()
-    quotes = {}
-    for item in candidates[:budget]:
-        symbol = str(item["السهم"])
+def main():
+    key = os.getenv('SAHMK_API_KEY', '').strip()
+    token = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+    chat_id = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+    if not all((key, token, chat_id)):
+        raise RuntimeError('Missing SAHMK_API_KEY / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID')
+    global sent
+    sent = load_sent()
+    LOG.info('Saudi AI Sniper — separated monitoring and alerts started')
+    threading.Thread(target=refresh_loop, args=(token, chat_id), daemon=True).start()
+    while True:
+        if not market_open(datetime.now(TZ)):
+            time.sleep(30)
+            continue
+        with lock:
+            symbols = list(watchlist.keys())[:60]
+        if not symbols:
+            time.sleep(15)
+            continue
+        ws = None
         try:
-            response = session.get(f"{BASE_URL}/quote/{symbol}/", timeout=20)
-            if response.status_code in (401, 403, 429):
-                LOG.warning("SAHMK quote HTTP %s", response.status_code)
-                break
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict) or str(payload.get("symbol")) != symbol:
-                continue
-            quotes[symbol] = {key: payload.get(key) for key in ("price", "volume", "updated_at", "is_delayed")}
-        except requests.RequestException as exc:
-            LOG.warning("Quote %s: %s", symbol, type(exc).__name__)
-    return quotes
+            ws = create_connection(WS_URL + quote(key, safe=''), timeout=15)
+            ws.settimeout(10)
+            subscribed = False
+            started = time.monotonic()
+            while market_open(datetime.now(TZ)) and time.monotonic() - started <= 300:
+                try:
+                    raw = ws.recv()
+                except WebSocketTimeoutException:
+                    continue
+                message = json.loads(raw)
+                event = message.get('type')
+                if event == 'connected' and not subscribed:
+                    limits = message.get('limits') or {}
+                    max_symbols = max(1, min(60, int(limits.get('max_symbols_per_connection') or 60)))
+                    per_call = max(1, min(20, int(limits.get('max_symbols_per_call') or 20)))
+                    count = min(len(symbols), max_symbols)
+                    for i in range(0, count, per_call):
+                        ws.send(json.dumps({'action': 'subscribe', 'symbols': symbols[i:i + per_call]}))
+                    subscribed = True
+                    LOG.info('Subscribed to %d symbols (provider limits respected)', count)
+                elif event == 'error':
+                    raise RuntimeError('WebSocket server error: ' + str(message.get('code', 'unknown')))
+                elif event == 'quote':
+                    try:
+                        on_quote(message, token, chat_id)
+                    except Exception:
+                        LOG.exception('Quote processing failed')
+            if subscribed:
+                recovered(token, chat_id, 'اتصال الأسعار اللحظية')
+            else:
+                raise RuntimeError('WebSocket did not confirm connection/subscription')
+        except Exception as exc:
+            LOG.exception('WebSocket connection failed')
+            issue(token, chat_id, 'اتصال الأسعار اللحظية', exc)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        time.sleep(10)
 
 
-def run(max_candidates=50, quote_budget=0):
-    LOG.info("Historical scanner requested")
-    session = sahmk_session()
-    all_symbols = tasi_equities(session)
-    symbols = dict(list(all_symbols.items())[:UNIVERSE_LIMIT])
-    LOG.info("SAHMK directory=%d selected=%d", len(all_symbols), len(symbols))
-    ranked, weeklies, failed, stats = scan_universe(symbols, max_candidates)
-    quotes = verify_quotes(ranked, session, budget=quote_budget)
-    report = {
-        "scanned_at_utc": datetime.now(timezone.utc).isoformat(),
-        "market": "TASI", "universe_size": len(symbols),
-        "directory_size": len(all_symbols),
-        "selection_method": "all active TASI equities from SAHMK company directory, capped by SCAN_UNIVERSE_LIMIT",
-        "summary": stats,
-        "historical_candidates": ranked + weeklies,
-        "weekly_candidates": weeklies,
-        "historical_failures": failed,
-        "sahmk_quotes": quotes,
-        "note": "Historical daily and completed weekly candles; no live entry confirmation.",
-    }
-    Path("market_scan_result.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
-    )
-    lines = [
-        "SAUDI AI SNIPER V8 - FULL MARKET HISTORICAL SCAN",
-        f"Directory: {len(all_symbols)}", f"Selected: {len(symbols)}",
-        f"Analyzed: {stats.get('analyzed', 0)}", f"Errors: {len(failed)}",
-        f"Daily setups: {stats.get('validated_setups', 0)}",
-        f"Weekly setups: {len(weeklies)}", f"Quotes retrieved: {len(quotes)}",
-        "TOP 10 DAILY WATCHLIST:",
-    ]
-    for item in ranked[:10]:
-        lines.append(f"{item.get('السهم')} | score={item.get('درجة_الجودة')} | {item.get('تصنيف_الماسح')}")
-    lines.append("WEEKLY SETUPS:")
-    for item in weeklies[:10]:
-        lines.append(f"{item['السهم']} | weekly close={item['بداية_نطاق_الشراء']}")
-    Path("market_scan_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    LOG.info("SCAN COMPLETE: selected=%d analyzed=%d failed=%d daily=%d weekly=%d",
-             len(symbols), stats.get("analyzed", 0), len(failed),
-             stats.get("validated_setups", 0), len(weeklies))
-    print("\n".join(lines), flush=True)
-    if stats.get("analyzed", 0) == 0:
-        raise RuntimeError("No stocks were actually analyzed")
-    return report
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run()
+if __name__ == '__main__':
+    main()

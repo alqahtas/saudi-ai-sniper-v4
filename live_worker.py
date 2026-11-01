@@ -23,6 +23,8 @@ WS_URL = 'wss://api.sahmk.sa/ws/v1/stocks/?api_key='
 REFRESH_SECONDS = max(900, int(os.getenv('SETUP_REFRESH_SECONDS', '1800')))
 MARKET_REFRESH_SECONDS = 180
 STATE = Path('live_alert_state.json')
+TRADES_STATE = Path('live_trade_tracking.json')
+active_trades = {}
 lock = threading.RLock()
 watchlist = {}
 market = None
@@ -59,6 +61,67 @@ def save_sent():
     except OSError:
         LOG.exception('Cannot save alert state')
 
+
+def load_trades():
+    try:
+        data = json.loads(TRADES_STATE.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): v for k, v in data.items() if isinstance(v, dict) and v.get('status') in ('active', 'target1')}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_trades():
+    try:
+        temp = TRADES_STATE.with_suffix('.tmp')
+        temp.write_text(json.dumps(active_trades, ensure_ascii=False), encoding='utf-8')
+        temp.replace(TRADES_STATE)
+    except OSError:
+        LOG.exception('Cannot save trade tracking state')
+
+
+def track_targets(symbol, price, token, chat_id):
+    """Monitor only previously alerted entries, even if setup expires or scanner changes."""
+    with lock:
+        trade = active_trades.get(symbol)
+        if not trade:
+            return
+        entry, stop = number(trade.get('entry')), number(trade.get('stop'))
+        target1, target2 = number(trade.get('target1')), number(trade.get('target2'))
+        if not all((entry, stop, target1, target2)) or not stop < entry < target1 < target2:
+            LOG.warning('Invalid active target configuration: %s', symbol)
+            return
+        status = trade.get('status')
+        if status not in ('active', 'target1'):
+            return
+        # Conservatively prioritize stop on each observed tick before targets.
+        if price <= stop:
+            event, new_status, label = 'STOP', 'stopped', '🛑 وصل السعر إلى وقف الخسارة'
+        elif price >= target2:
+            event, new_status, label = 'TARGET2', 'closed', '🏁 تم تحقيق الهدف الثاني'
+        elif price >= target1 and status == 'active':
+            event, new_status, label = 'TARGET1', 'target1', '✅ تم تحقيق الهدف الأول'
+        else:
+            return
+        # A single quote may jump directly above both targets. Mark both as reached.
+        gain = (price / entry - 1) * 100
+        msg = (f'🇸🇦 Saudi AI Sniper | تحديث متابعة\n{label}\n'
+               f'السهم: {trade.get("name", symbol)} ({symbol})\n'
+               f'السعر المرصود: {price:.3f} ريال\n'
+               f'الدخول المرجعي: {entry:.3f} ريال\n'
+               f'التغير النظري عند السعر المرصود: {gain:+.2f}%\n'
+               f'الهدف الأول: {target1:.3f} | الهدف الثاني: {target2:.3f}\n'
+               f'وقف الخسارة الأصلي: {stop:.3f}\n'
+               f'الحالة: {"مستمر للهدف الثاني" if new_status == "target1" else "انتهت المتابعة"}\n'
+               '⚠️ لا يوجد تنفيذ بيع تلقائي؛ الأسعار المرصودة لا تضمن تنفيذًا.')
+        if notify(token, chat_id, msg):
+            trade['status'] = new_status
+            trade['last_event'] = event
+            trade['updated_at'] = datetime.now(TZ).isoformat()
+            if new_status in ('closed', 'stopped'):
+                active_trades.pop(symbol, None)
+            save_trades()
 
 def notify(token, chat_id, message):
     try:
@@ -239,8 +302,12 @@ def on_quote(message, token, chat_id):
         current_market = market
         previous = last_prices.get(symbol)
         last_prices[symbol] = price
+    track_targets(symbol, price, token, chat_id)
     if row is None or not valid_setup(row):
         return
+    with lock:
+        if symbol in active_trades:
+            return
     entry = number(row.get('بداية_نطاق_الشراء'))
     if not current_market or not current_market['positive'] or entry is None or previous is None:
         return
@@ -268,6 +335,12 @@ def on_quote(message, token, chat_id):
         with lock:
             sent.add(unique)
             save_sent()
+            target1 = number(row.get('هدف_تقديري'))
+            target2 = number(row.get('هدف_ثان'))
+            stop = number(row.get('وقف_تقديري'))
+            if all((target1, target2, stop)) and stop < entry < target1 < target2:
+                active_trades[symbol] = {'name': row.get('اسم_الشركة', symbol), 'entry': entry, 'stop': stop, 'target1': target1, 'target2': target2, 'status': 'active', 'started_at': datetime.now(TZ).isoformat()}
+                save_trades()
         LOG.info('LIVE ALERT SENT: %s %.3f', symbol, price)
 
 
@@ -277,8 +350,9 @@ def main():
     chat_id = os.getenv('TELEGRAM_CHAT_ID', '').strip()
     if not all((key, token, chat_id)):
         raise RuntimeError('Missing SAHMK_API_KEY / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID')
-    global sent
+    global sent, active_trades
     sent = load_sent()
+    active_trades = load_trades()
     LOG.info('Saudi AI Sniper — separated monitoring and alerts started')
     threading.Thread(target=refresh_loop, args=(token, chat_id), daemon=True).start()
     while True:
@@ -286,7 +360,7 @@ def main():
             time.sleep(30)
             continue
         with lock:
-            symbols = list(watchlist.keys())[:60]
+            symbols = list(dict.fromkeys(list(active_trades.keys()) + list(watchlist.keys())))[:60]
         if not symbols:
             time.sleep(15)
             continue
@@ -296,7 +370,11 @@ def main():
             ws.settimeout(10)
             subscribed = False
             started = time.monotonic()
+            last_ping = started
             while market_open(datetime.now(TZ)) and time.monotonic() - started <= 300:
+                if time.monotonic() - last_ping >= 30:
+                    ws.send(json.dumps({'action': 'ping'}))
+                    last_ping = time.monotonic()
                 try:
                     raw = ws.recv()
                 except WebSocketTimeoutException:
@@ -313,7 +391,10 @@ def main():
                     subscribed = True
                     LOG.info('Subscribed to %d symbols (provider limits respected)', count)
                 elif event == 'error':
-                    raise RuntimeError('WebSocket server error: ' + str(message.get('code', 'unknown')))
+                    code = str(message.get('code') or 'unknown')
+                    if code.startswith('MARKET_DATA_ENTITLEMENT') or code in ('WS_AUTH_OR_ACCESS',):
+                        raise PermissionError('WebSocket access denied: ' + code)
+                    raise RuntimeError('WebSocket server error: ' + code)
                 elif event == 'quote':
                     try:
                         on_quote(message, token, chat_id)
@@ -323,6 +404,10 @@ def main():
                 recovered(token, chat_id, 'اتصال الأسعار اللحظية')
             else:
                 raise RuntimeError('WebSocket did not confirm connection/subscription')
+        except PermissionError as exc:
+            LOG.error('WebSocket authorization denied; stop retries: %s', exc)
+            issue(token, chat_id, 'صلاحية بيانات الأسعار اللحظية', exc)
+            return
         except Exception as exc:
             LOG.exception('WebSocket connection failed')
             issue(token, chat_id, 'اتصال الأسعار اللحظية', exc)

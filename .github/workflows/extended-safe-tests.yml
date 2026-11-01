@@ -1,0 +1,55 @@
+name: Saudi AI Sniper Extended Safe Tests
+
+on:
+  push:
+    branches:
+      - fix/sahmk-integration-review-20261101
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-and-strategy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -r requirements.txt
+      - name: Compile all Python files
+        run: python -m compileall -q .
+      - name: Run offline target tracking tests
+        run: python -m unittest discover -v -p 'test_*.py'
+      - name: Validate strategy module imports
+        run: python -c "import market_scanner, sniper_core, sahmk_pro, live_worker, support_bot; print('All modules imported successfully')"
+
+  telegram-and-sahmk-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt
+      - name: Check API and Telegram interfaces without credentials
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          worker = ast.parse(Path('live_worker.py').read_text())
+          support = ast.parse(Path('support_bot.py').read_text())
+          functions = {n.name for n in worker.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+          assert {'on_quote','track_targets','market_status','main','load_trades','save_trades'}.issubset(functions)
+          assert {'levels','main'}.issubset({n.name for n in support.body if isinstance(n, ast.FunctionDef)})
+          print('SAHMK/Telegram code interfaces present; no live API calls attempted')
+          PY

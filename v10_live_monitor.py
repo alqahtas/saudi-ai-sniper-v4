@@ -398,6 +398,21 @@ def scan_once(force=False):
 
     metadata, stocks = load_watchlist()
     s = session()
+    # Historical watchlists may contain only technical data, without company names.
+    # Resolve missing names from the existing SAHMK TASI directory once per scan.
+    unnamed = [symbol for symbol, stock in stocks.items()
+               if company_display_name(symbol, stock) == str(symbol)]
+    if unnamed:
+        try:
+            from market_scanner import tasi_equities
+            names = tasi_equities(s)
+            for symbol in unnamed:
+                if names.get(symbol):
+                    stocks[symbol]["name_ar"] = names[symbol]
+            LOG.info("Company names resolved | missing=%d resolved=%d",
+                     len(unnamed), sum(bool(names.get(symbol)) for symbol in unnamed))
+        except Exception as exc:
+            LOG.warning("Company directory unavailable; retaining tickers: %s", type(exc).__name__)
     state = read_json(STATE_FILE, {})
 
     total = len(stocks)

@@ -258,7 +258,18 @@ def valid_zones(stock):
     return result
 
 
+def company_display_name(symbol, stock):
+    """Prefer a supplied Arabic company name, never invent one."""
+    for key in ("name_ar", "company_name_ar", "اسم_الشركة", "اسم الشركة",
+                "company_name", "name", "name_en"):
+        name = stock.get(key)
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return str(symbol)
+
+
 def evaluate(symbol, stock, quote):
+    display_name = company_display_name(symbol, stock)
     price = quote["price"]
     events = []
 
@@ -281,7 +292,7 @@ def evaluate(symbol, stock, quote):
                 "level": bottom,
                 "message": (
                     f"⚠️ V10 | كسر دعم\n"
-                    f"السهم: {symbol}\n"
+                    f"الشركة: {display_name} ({symbol})\n"
                     f"السعر: {price:.2f}\n"
                     f"الدعم: {bottom:.2f}\n"
                     f"تنبيه مخاطر، وليس أمر بيع."
@@ -294,7 +305,7 @@ def evaluate(symbol, stock, quote):
                 "level": bottom,
                 "message": (
                     f"🔎 V10 | مراقبة ارتداد محتمل\n"
-                    f"السهم: {symbol}\n"
+                    f"الشركة: {display_name} ({symbol})\n"
                     f"السعر: {price:.2f}\n"
                     f"منطقة الدعم: {bottom:.2f} - {top:.2f}\n"
                     f"تأكيدات المنطقة: {zone['confirmations']}\n"
@@ -322,7 +333,7 @@ def evaluate(symbol, stock, quote):
             "level": resistance,
             "message": (
                 f"📈 V10 | اختراق للمراقبة\n"
-                f"السهم: {symbol}\n"
+                f"الشركة: {display_name} ({symbol})\n"
                 f"السعر: {price:.2f}\n"
                 f"المقاومة: {resistance:.2f}\n"
                 f"إشارات تاريخية: {len(strategies)}\n"

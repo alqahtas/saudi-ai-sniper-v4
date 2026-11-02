@@ -356,6 +356,9 @@ def process_events(events, state, quote):
         )
 
         delivered = telegram_send(message)
+        if not delivered:
+            LOG.error("V10 alert delivery failed for %s; cooldown NOT recorded", quote["symbol"])
+            continue
 
         record = {
             "time": current.isoformat(),
@@ -423,9 +426,8 @@ def scan_once(force=False):
         )
 
     if valid == 0:
-        LOG.error(
-            "NO VERIFIED LIVE QUOTES. "
-            "Check SAHMK endpoint, authentication, "
+        raise RuntimeError(
+            "NO VERIFIED LIVE QUOTES. Check SAHMK endpoint, authentication, "
             "response fields and provider timestamps."
         )
 

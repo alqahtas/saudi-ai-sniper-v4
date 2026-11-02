@@ -1,0 +1,29 @@
+name: SAHMK Depth Entitlement Check
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'sahmk_depth_probe.py'
+      - 'tests/test_sahmk_depth_probe.py'
+      - '.github/workflows/sahmk_depth_access.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  depth-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'websocket-client>=1.8,<2'
+      - name: Verify depth parser without credentials
+        run: python -m unittest discover -s tests -p 'test_sahmk_depth_probe.py' -v
+      - name: Verify SAHMK depth permission and snapshot
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: python -u sahmk_depth_probe.py

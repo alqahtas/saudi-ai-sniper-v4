@@ -84,6 +84,42 @@ jobs:
             exit 1
           fi
 
+      - name: Restore prior alert cooldown state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATE_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name == "v10-alert-state" and .expired == false)] | sort_by(.created_at) | reverse | .[0].id // empty')
+          if [ -n "$STATE_ID" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${STATE_ID}/zip" > /tmp/v10_alert_state.zip
+            unzip -o /tmp/v10_alert_state.zip -d .
+            echo "Restored prior V10 alert state"
+          else
+            echo "No prior alert state. Starting fresh."
+          fi
+
+      - name: Scan current watchlist and send actionable watch alerts
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          test -n "$TELEGRAM_BOT_TOKEN" && test -n "$TELEGRAM_CHAT_ID" || {
+            echo "::error::Telegram secrets not configured"; exit 1;
+          }
+          python -u v10_live_monitor.py --once
+
+      - name: Save alert cooldown state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v10-alert-state
+          path: |
+            v10_monitor_state.json
+            v10_events.json
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Upload diagnostic watchlist
         if: always()
         uses: actions/upload-artifact@v4

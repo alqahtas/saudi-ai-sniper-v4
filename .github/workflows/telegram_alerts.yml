@@ -3,7 +3,8 @@ name: Saudi AI Sniper - Telegram Alerts
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 13 * * 0-4'
+    # 13:30 Asia/Riyadh = 10:30 UTC; schedule is not intraday continuous
+    - cron: '30 10 * * 0-4'
 
 permissions:
   contents: read

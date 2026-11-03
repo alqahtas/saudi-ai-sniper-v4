@@ -277,8 +277,17 @@ def _help():
         "سأعطيك سعرًا، دعومًا ومقاومات، زخمًا، وضعًا ماليًا، "
         "وأمر LIMIT مقترحًا مع وقف 2% وهدفين وتصنيف مدة الصفقة، "
         "مع ملخص عمق السوق وفريم 60 دقيقة والوضع المالي.\n"
+        "في القناة: اكتب اسم الشركة وسأرد في القناة ليشاهده الجميع.\n"
         "للتقرير الكامل أرسل: /details سابك"
     )
+
+
+
+def telegram_message(update):
+    """Accept private/group messages and admin posts published in the channel."""
+    if not isinstance(update, dict):
+        return {}
+    return update.get("message") or update.get("channel_post") or {}
 
 
 def main():
@@ -299,7 +308,11 @@ def main():
         try:
             response = requests.get(
                 api + "/getUpdates",
-                params={"timeout": 25, "offset": offset, "allowed_updates": '["message"]'},
+                params={
+                    "timeout": 25,
+                    "offset": offset,
+                    "allowed_updates": '["message","channel_post"]',
+                },
                 timeout=35,
             )
             if response.status_code == 409:
@@ -312,10 +325,10 @@ def main():
                 raise RuntimeError("Telegram getUpdates failed")
             for update in payload.get("result", []):
                 offset = max(offset or 0, int(update["update_id"]) + 1)
-                msg = update.get("message") or {}
+                msg = telegram_message(update)
                 chat = msg.get("chat") or {}
                 chat_id = str(chat.get("id") or "")
-                user = msg.get("from") or {}
+                user = msg.get("from") or msg.get("sender_chat") or {}
                 user_id = str(user.get("id") or chat_id)
                 raw = str(msg.get("text") or "").strip()
                 command = raw.split(maxsplit=1)[0].split("@", 1)[0].lower() if raw else ""

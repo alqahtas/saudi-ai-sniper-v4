@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from support_bot import _help, compact_analysis, completed_daily, resolve_company
+from support_bot import _help, compact_analysis, completed_daily, resolve_company, telegram_message
 
 
 class SupportBotTests(unittest.TestCase):
@@ -66,6 +66,20 @@ P/E غير متوفر | P/B غير متوفر"""
 
     def test_help_exposes_optional_full_report(self):
         self.assertIn("/details سابك", _help())
+
+
+    def test_accepts_channel_post_for_public_reply(self):
+        update = {
+            "update_id": 1,
+            "channel_post": {
+                "chat": {"id": -1003354695969, "type": "channel"},
+                "sender_chat": {"id": -1003354695969},
+                "text": "سابك",
+            },
+        }
+        message = telegram_message(update)
+        self.assertEqual(message["text"], "سابك")
+        self.assertEqual(message["chat"]["id"], -1003354695969)
 
     def test_excludes_current_open_market_candle(self):
         tz = ZoneInfo("Asia/Riyadh")

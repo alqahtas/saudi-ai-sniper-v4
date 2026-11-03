@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from support_bot import _help, analyze_company, compact_analysis, completed_daily, resolve_company, telegram_message
+from support_bot import _help, analyze_company, compact_analysis, completed_daily, parse_query_mode, resolve_company, telegram_message
 
 
 class SupportBotTests(unittest.TestCase):
@@ -14,13 +14,21 @@ class SupportBotTests(unittest.TestCase):
             {"symbol": "2222", "name_ar": "أرامكو السعودية", "name_en": "Saudi Aramco", "short_name": "ARAMCO"},
             {"symbol": "1120", "name_ar": "مصرف الراجحي", "name_en": "Al Rajhi Bank", "short_name": "ALRAJHI"},
             {"symbol": "7010", "name_ar": "اس تي سي", "name_en": "stc", "short_name": "STC"},
+            {"symbol": "2223", "name_ar": "أرامكو السعودية لزيوت الأساس - لوبريف", "name_en": "Luberef", "short_name": "LUBEREF"},
         ]
 
     def test_resolves_symbol_arabic_and_english(self):
         self.assertEqual(resolve_company("2222", self.rows)[0]["symbol"], "2222")
         self.assertEqual(resolve_company("أرامكو", self.rows)[0]["symbol"], "2222")
         self.assertEqual(resolve_company("stc", self.rows)[0]["symbol"], "7010")
+        self.assertEqual(resolve_company("لوبرف", self.rows)[0]["symbol"], "2223")
 
+
+
+    def test_parses_opportunity_mode_without_losing_company_name(self):
+        self.assertEqual(parse_query_mode("فرص سابك"), ("سابك", True))
+        self.assertEqual(parse_query_mode("فرصة أرامكو"), ("أرامكو", True))
+        self.assertEqual(parse_query_mode("سابك"), ("سابك", False))
 
     def test_compact_analysis_keeps_decision_and_hides_raw_pro_detail(self):
         full = """🇸🇦 تحليل سابك (2010)

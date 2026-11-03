@@ -16,9 +16,10 @@ import requests
 
 from fundamental_engine import analyze as fundamental_analysis
 from market_scanner import BASE_URL, sahmk_session
-from sahmk_intelligence import fetch_intelligence, format_pro_sections
+from sahmk_intelligence import SahmkProClient, fetch_intelligence, format_pro_sections
 from sniper_core import daily
 from stock_advisor import build_recommendation, format_recommendation
+from timeframe_analysis import format_timeframe_table
 from telegram_delivery import send_message
 
 LOG = logging.getLogger("saudi-public-bot")
@@ -109,6 +110,7 @@ def resolve_company(query, rows):
         "alrajhi": "1120", "الراجحي": "1120",
         "stc": "7010", "الاتصالات": "7010",
         "sabic": "2010", "سابك": "2010",
+        "luberef": "2223", "لوبرف": "2223", "لوبريف": "2223",
     }
     alias_symbol = aliases.get(needle)
     if alias_symbol:
@@ -226,13 +228,17 @@ def compact_analysis(message):
     return "\n".join(line for line in compact if line)
 
 
-def analyze_company(company, detailed=False):
+def analyze_company(company, detailed=False, opportunity=False):
     symbol = company["symbol"]
     name = company.get("name_ar") or company.get("name_en") or symbol
     quote, fundamentals = {}, {}
     try:
         session = sahmk_session()
-        response = session.get(f"{BASE_URL}/quote/{symbol}/", params={"data_mode": "realtime"}, timeout=20)
+        response = session.get(
+            f"{BASE_URL}/quote/{symbol}/",
+            params={"data_mode": "realtime"},
+            timeout=20,
+        )
         response.raise_for_status()
         payload = response.json()
         quote = payload if isinstance(payload, dict) else {}
@@ -250,20 +256,41 @@ def analyze_company(company, detailed=False):
     if quote.get("is_delayed") is True:
         message = "⏱️ تنبيه: السعر مزوّد كبيانات متأخرة.\n" + message
 
+    intelligence = {"data": {}, "errors": {}}
     try:
         intelligence = fetch_intelligence(symbol)
+        if opportunity:
+            try:
+                intelligence.setdefault("data", {})["intraday15"] = (
+                    SahmkProClient().intraday(symbol, "15min")
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "intraday15_failed symbol=%s error=%s",
+                    symbol,
+                    type(exc).__name__,
+                )
         message += format_pro_sections(intelligence)
     except Exception as exc:
         LOG.warning("pro_intelligence_failed symbol=%s error=%s", symbol, type(exc).__name__)
-        message += "\n\n📊 بيانات SAHMK Pro: تعذر جلبها مؤقتًا، والتحليل الأساسي أعلاه ما زال صالحًا."
+        message += (
+            "\n\n📊 بيانات SAHMK Pro: تعذر جلبها مؤقتًا، "
+            "والتحليل الأساسي أعلاه ما زال صالحًا."
+        )
+
+    table = format_timeframe_table(candles, intelligence, opportunity=opportunity)
     reply = message if detailed else compact_analysis(message)
+    if table:
+        reply += "\n\n" + table
     LOG.info(
-        "analysis_ready symbol=%s mode=%s chars=%s",
+        "analysis_ready symbol=%s mode=%s view=%s chars=%s",
         symbol,
         "full" if detailed else "compact",
+        "opportunity" if opportunity else "overview",
         len(reply),
     )
     return reply
+
 
 
 def levels(symbol):
@@ -280,13 +307,22 @@ def _help():
     return (
         "أرسل اسم الشركة أو رمزها، مثل:\n"
         "أرامكو\n2222\nالراجحي\nstc\n\n"
-        "سأعطيك سعرًا، دعومًا ومقاومات، زخمًا، وضعًا ماليًا، "
-        "وأمر LIMIT مقترحًا مع وقف 2% وهدفين وتصنيف مدة الصفقة، "
-        "مع ملخص عمق السوق وفريم 60 دقيقة والوضع المالي.\n"
-        "في القناة: اكتب اسم الشركة وسأرد في القناة ليشاهده الجميع.\n"
+        "الاسم فقط يعطي تحليل 4 ساعات/يومي/أسبوعي/شهري.\n"
+        "لصيد مضاربي اكتب: فرص سابك\n"
+        "وسأعرض 15 دقيقة/ساعة/4 ساعات/يومي مع الدخول والوقف والأهداف.\n"
         "للتقرير الكامل أرسل: /details سابك"
     )
 
+
+
+
+def parse_query_mode(raw):
+    """'فرص سابك' selects short trading frames; normal names use broad frames."""
+    text = str(raw or "").strip()
+    match = re.match(r"^فرص(?:ة)?\s*[:\-]?\s*(.+)$", text, flags=re.IGNORECASE)
+    if match and match.group(1).strip():
+        return match.group(1).strip(), True
+    return text, False
 
 
 def telegram_message(update):
@@ -352,6 +388,7 @@ def main():
                     answer = "وصلت الحد المؤقت: 10 تحليلات في الدقيقة. جرّب بعد دقيقة."
                 else:
                     query = raw.split(maxsplit=1)[1].strip() if command == "/details" else raw
+                    query, opportunity = parse_query_mode(query)
                     try:
                         matches = resolve_company(query, company_directory())
                         if not matches:
@@ -362,7 +399,11 @@ def main():
                             )
                             answer = "الاسم يحتمل أكثر من شركة. أرسل الرمز المطلوب:\n" + options
                         else:
-                            answer = analyze_company(matches[0], detailed=command == "/details")
+                            answer = analyze_company(
+                                matches[0],
+                                detailed=command == "/details",
+                                opportunity=opportunity,
+                            )
                     except Exception as exc:
                         LOG.exception("analysis_failed error=%s", type(exc).__name__)
                         answer = "تعذر إكمال التحليل الآن. البيانات ناقصة أو مزود السوق غير متاح؛ جرّب لاحقًا."

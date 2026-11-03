@@ -7,6 +7,9 @@ import requests
 
 LOG = logging.getLogger(__name__)
 TELEGRAM_TEXT_LIMIT = 4096
+# Numeric IDs are routing identifiers, not credentials. This private channel ID
+# was verified through the bot's my_chat_member update after admin approval.
+DEFAULT_CHANNEL_ID = "-1003354695969"
 
 
 def split_text(text, limit=4000):
@@ -32,7 +35,7 @@ def notification_targets():
     """Return de-duplicated owner and optional channel targets."""
     values = (
         os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-        os.getenv("TELEGRAM_CHANNEL_ID", "").strip(),
+        os.getenv("TELEGRAM_CHANNEL_ID", DEFAULT_CHANNEL_ID).strip(),
     )
     return list(dict.fromkeys(value for value in values if value))
 

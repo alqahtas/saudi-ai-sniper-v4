@@ -148,7 +148,7 @@ def build_recommendation(candles, quote=None, fundamentals=None, *, stop_pct=Non
     resistances = sorted(x for x in all_levels if x > current)[:3]
     nearest_support = supports[0] if supports else current * 0.98
 
-    entry = min(current * 0.995, nearest_support * 1.002)
+    entry = round(min(current * 0.995, nearest_support * 1.002), 2)
     stop_pct = float(stop_pct if stop_pct is not None else os.getenv("SAUDI_STOP_LOSS_PCT", "0.02"))
     stop_pct = min(max(stop_pct, 0.005), 0.10)
     stop = entry * (1 - stop_pct)

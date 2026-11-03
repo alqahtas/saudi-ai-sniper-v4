@@ -178,6 +178,17 @@ def analyze_company(company):
     return message
 
 
+
+def levels(symbol):
+    """Backward-compatible symbol lookup used by older deployments/tests."""
+    symbol = str(symbol or "").strip().upper().replace(".SR", "")
+    if not symbol.isdigit():
+        return "رمز السهم غير صالح."
+    matches = resolve_company(symbol, company_directory())
+    if not matches:
+        return "لم يتم العثور على السهم."
+    return analyze_company(matches[0])
+
 def _help():
     return (
         "أرسل اسم الشركة أو رمزها، مثل:\n"

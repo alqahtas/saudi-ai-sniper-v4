@@ -153,7 +153,80 @@ def _allowed(user_id, now=None):
     return True
 
 
-def analyze_company(company):
+
+def compact_analysis(message):
+    """Return the decision-first Telegram reply; /details keeps the full report."""
+    lines = [line.strip() for line in str(message or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    try:
+        pro_at = lines.index("📊 بيانات SAHMK Pro")
+    except ValueError:
+        pro_at = len(lines)
+    core, pro = lines[:pro_at], lines[pro_at + 1:]
+
+    def first(prefix, source=lines):
+        return next((line for line in source if line.startswith(prefix)), "")
+
+    def available_parts(line):
+        return [
+            part.strip() for part in line.split("|")
+            if part.strip() and "غير متوفر" not in part
+        ]
+
+    title = core[0]
+    price = first("السعر:", core)
+    plan = first("🎯 الخطة:", core)
+    action = next((line for line in core if line.startswith(("ضع أمر", "لا تدخل"))), "")
+    stop = first("وقف الخسارة:", core)
+    target1 = first("الهدف الأول:", core)
+    target2 = first("الهدف الثاني:", core)
+    support_line = first("الدعوم:", core)
+    resistance_line = first("المقاومات:", core)
+    support = support_line.split(":", 1)[1].split("،", 1)[0].strip() if ":" in support_line else ""
+    resistance = resistance_line.split(":", 1)[1].split("،", 1)[0].strip() if ":" in resistance_line else ""
+    levels = (
+        f"🧱 أقرب دعم: {support} | أقرب مقاومة: {resistance}"
+        if support and resistance else ""
+    )
+    momentum = first("📈 الزخم:", core)
+    financial_label = first("💼 ماليًا:", core)
+    financial_bits = []
+    for prefix in ("P/E:", "ROE:"):
+        financial_bits.extend(available_parts(first(prefix, core)))
+    financial = " | ".join([part for part in [financial_label] + financial_bits if part])
+
+    depth_reading = next(
+        (
+            line.rstrip(".") for line in pro
+            if (
+                "أقوى من" in line
+                or line.startswith("العمق متوازن")
+                or line.startswith("عمق السوق غير متوفر")
+            )
+        ),
+        "",
+    )
+    spread = first("السبريد:", pro)
+    depth = "📚 " + " | ".join(
+        part for part in (depth_reading, spread) if part and "غير متوفر" not in part
+    ) if depth_reading or spread else ""
+    intraday = first("⏱️ فريم 60 دقيقة:", pro)
+    tasi = first("🇸🇦 تاسي:", pro)
+    condition = next((line for line in core if line.startswith("الخطة مشروطة")), "")
+    disclaimer = first("تحليل آلي", core)
+
+    compact = [
+        title, price, plan, action,
+        " | ".join(part for part in (stop, target1, target2) if part),
+        levels, momentum, financial, depth, intraday, tasi,
+        condition, disclaimer,
+    ]
+    return "\n".join(line for line in compact if line)
+
+
+def analyze_company(company, detailed=False):
     symbol = company["symbol"]
     name = company.get("name_ar") or company.get("name_en") or symbol
     quote, fundamentals = {}, {}
@@ -203,7 +276,8 @@ def _help():
         "أرامكو\n2222\nالراجحي\nstc\n\n"
         "سأعطيك سعرًا، دعومًا ومقاومات، زخمًا، وضعًا ماليًا، "
         "وأمر LIMIT مقترحًا مع وقف 2% وهدفين وتصنيف مدة الصفقة، "
-        "مع عمق السوق والتنفيذات وفريم 60 دقيقة والبيانات المالية الموسعة."
+        "مع ملخص عمق السوق وفريم 60 دقيقة والوضع المالي.\n"
+        "للتقرير الكامل أرسل: /details سابك"
     )
 
 
@@ -253,11 +327,14 @@ def main():
                     answer = _help()
                 elif command == "/status":
                     answer = "✅ البوت يعمل. أرسل اسم شركة أو رمز سهم سعودي."
+                elif command == "/details" and len(raw.split(maxsplit=1)) == 1:
+                    answer = "أرسل اسم الشركة بعد الأمر، مثال: /details سابك"
                 elif not _allowed(user_id):
                     answer = "وصلت الحد المؤقت: 10 تحليلات في الدقيقة. جرّب بعد دقيقة."
                 else:
+                    query = raw.split(maxsplit=1)[1].strip() if command == "/details" else raw
                     try:
-                        matches = resolve_company(raw, company_directory())
+                        matches = resolve_company(query, company_directory())
                         if not matches:
                             answer = "ما لقيت الشركة. جرّب الاسم الرسمي أو رمز تداول المكوّن من 4 أرقام."
                         elif len(matches) > 1:
@@ -266,7 +343,7 @@ def main():
                             )
                             answer = "الاسم يحتمل أكثر من شركة. أرسل الرمز المطلوب:\n" + options
                         else:
-                            answer = analyze_company(matches[0])
+                            answer = analyze_company(matches[0], detailed=command == "/details")
                     except Exception as exc:
                         LOG.exception("analysis_failed error=%s", type(exc).__name__)
                         answer = "تعذر إكمال التحليل الآن. البيانات ناقصة أو مزود السوق غير متاح؛ جرّب لاحقًا."

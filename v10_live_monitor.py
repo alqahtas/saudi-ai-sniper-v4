@@ -21,6 +21,8 @@ from pathlib import Path
 
 import requests
 
+from telegram_delivery import broadcast
+
 LOG = logging.getLogger("V10")
 RIYADH = timezone(timedelta(hours=3))
 
@@ -211,29 +213,12 @@ def fetch_quote(s, symbol):
 
 
 def telegram_send(message):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-    if not token or not chat_id:
-        LOG.info("Telegram not configured; alert logged only")
-        return False
-
     try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": message,
-            },
-            timeout=15,
-        )
-        response.raise_for_status()
-        result = response.json()
-        return bool(result.get("ok"))
-    except (requests.RequestException, ValueError) as exc:
-        LOG.error("Telegram error: %s", exc)
+        result = broadcast(message)
+        return any(result.values())
+    except Exception as exc:
+        LOG.error("Telegram error: %s", type(exc).__name__)
         return False
-
 
 def valid_zones(stock):
     zones = stock.get("support_zones", [])

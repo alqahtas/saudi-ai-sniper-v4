@@ -22,6 +22,7 @@ jobs:
       SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
 
     steps:
       - name: Checkout repository
@@ -39,25 +40,11 @@ jobs:
       - name: Test Telegram connection
         run: |
           python - <<'PY'
-          import os
-          import requests
-
-          token = os.environ["TELEGRAM_BOT_TOKEN"]
-          chat_id = os.environ["TELEGRAM_CHAT_ID"]
-
-          response = requests.post(
-              f"https://api.telegram.org/bot{token}/sendMessage",
-              json={
-                  "chat_id": chat_id,
-                  "text": "✅ Saudi AI Sniper V5 - Telegram connection successful"
-              },
-              timeout=30,
-          )
-          response.raise_for_status()
-          if not response.json().get("ok"):
-              raise RuntimeError("Telegram rejected test message")
-
-          print("Telegram connection successful")
+          from telegram_delivery import broadcast
+          result = broadcast("✅ Saudi AI Sniper - Telegram connection successful")
+          if not all(result.values()):
+              raise RuntimeError("At least one configured Telegram target failed")
+          print("Telegram targets verified:", len(result))
           PY
 
       - name: Scan TASI and send qualified alerts

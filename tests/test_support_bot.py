@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from support_bot import _help, analyze_company, compact_analysis, completed_daily, parse_query_mode, resolve_company, telegram_message
+from support_bot import _help, analyze_company, compact_analysis, completed_daily, overview_analysis, parse_query_mode, resolve_company, telegram_message
 
 
 class SupportBotTests(unittest.TestCase):
@@ -62,16 +62,25 @@ ROE: -16.65% | هامش صافي: -22.12%
 P/E غير متوفر | P/B غير متوفر"""
 
         compact = compact_analysis(full)
+        overview = overview_analysis(full)
 
         self.assertIn("ضع أمر LIMIT", compact)
         self.assertIn("أقرب دعم: 47.3", compact)
-        self.assertIn("P/B: 0.96", compact)
         self.assertIn("عروض البيع أقوى", compact)
-        self.assertIn("فريم 60 دقيقة", compact)
+        self.assertNotIn("P/B: 0.96", compact)
+        self.assertNotIn("فريم 60 دقيقة", compact)
+        self.assertNotIn("تاسي:", compact)
         self.assertNotIn("طلبات:", compact)
         self.assertNotIn("وقت السعر:", compact)
         self.assertNotIn("غير متوفر", compact)
         self.assertLess(len(compact), len(full))
+
+        self.assertIn("نظرة شاملة للسهم", overview)
+        self.assertIn("P/B: 0.96", overview)
+        self.assertIn("تاسي:", overview)
+        self.assertNotIn("ضع أمر LIMIT", overview)
+        self.assertNotIn("وقف الخسارة:", overview)
+        self.assertNotIn("الهدف الأول:", overview)
 
     def test_help_exposes_optional_full_report(self):
         self.assertIn("/details سابك", _help())
@@ -128,6 +137,9 @@ ROE: -16.65% | هامش صافي: -22.12%
 
         self.assertNotIn("وقت السعر:", compact)
         self.assertNotIn("طلبات:", compact)
+        self.assertNotIn("ضع أمر LIMIT", compact)
+        self.assertIn("نظرة شاملة للسهم", compact)
+        self.assertIn("💼 ماليًا:", compact)
         self.assertIn("أقرب دعم: 47.30", compact)
         self.assertIn("وقت السعر:", detailed)
         self.assertIn("طلبات:", detailed)

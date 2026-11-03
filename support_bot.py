@@ -256,8 +256,14 @@ def analyze_company(company, detailed=False):
     except Exception as exc:
         LOG.warning("pro_intelligence_failed symbol=%s error=%s", symbol, type(exc).__name__)
         message += "\n\n📊 بيانات SAHMK Pro: تعذر جلبها مؤقتًا، والتحليل الأساسي أعلاه ما زال صالحًا."
-    return message
-
+    reply = message if detailed else compact_analysis(message)
+    LOG.info(
+        "analysis_ready symbol=%s mode=%s chars=%s",
+        symbol,
+        "full" if detailed else "compact",
+        len(reply),
+    )
+    return reply
 
 
 def levels(symbol):

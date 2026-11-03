@@ -1,10 +1,11 @@
 import unittest
+from unittest.mock import Mock, patch
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from support_bot import _help, compact_analysis, completed_daily, resolve_company, telegram_message
+from support_bot import _help, analyze_company, compact_analysis, completed_daily, resolve_company, telegram_message
 
 
 class SupportBotTests(unittest.TestCase):
@@ -67,6 +68,61 @@ P/E غير متوفر | P/B غير متوفر"""
     def test_help_exposes_optional_full_report(self):
         self.assertIn("/details سابك", _help())
 
+
+
+    def test_analyze_company_uses_compact_reply_unless_details_requested(self):
+        full_core = """🇸🇦 تحليل سابك (2010)
+السعر: 47.44 ريال | التغير: 0.94%
+🎯 الخطة: مضاربة لحظية
+ضع أمر LIMIT مقترح عند 47.20 ريال
+وقف الخسارة: 46.26 ريال
+الهدف الأول: 49.38 ريال
+الهدف الثاني: 49.56 ريال
+الدعوم: 47.30، 47.02
+المقاومات: 47.76، 48.16
+📈 الزخم: محايد | RSI 54.7
+💼 ماليًا: مرتفع المخاطر
+ROE: -16.65% | هامش صافي: -22.12%
+الخطة مشروطة بثبات الدعم.
+تحليل آلي لأغراض معلوماتية وليس توصية استثمارية"""
+        pro = """
+📊 بيانات SAHMK Pro
+وقت السعر: الآن | لحظي
+طلبات: 47.42×6
+عروض: 47.44×8,587
+السبريد: 0.02 ريال
+عروض البيع أقوى من الطلبات في أول 5 مستويات.
+⏱️ فريم 60 دقيقة: صاعد
+🇸🇦 تاسي: 9,876.13"""
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {}
+        session = Mock()
+        session.get.return_value = response
+        candles = pd.DataFrame(
+            {"Close": [46.0, 47.0]},
+            index=pd.to_datetime(["2026-11-01", "2026-11-02"]),
+        )
+        company = {"symbol": "2010", "name_ar": "سابك"}
+
+        with (
+            patch("support_bot.sahmk_session", return_value=session),
+            patch("support_bot.daily", return_value=candles),
+            patch("support_bot.fundamental_analysis", return_value={}),
+            patch("support_bot.build_recommendation", return_value={}),
+            patch("support_bot.format_recommendation", return_value=full_core),
+            patch("support_bot.fetch_intelligence", return_value={}),
+            patch("support_bot.format_pro_sections", return_value=pro),
+        ):
+            compact = analyze_company(company)
+            detailed = analyze_company(company, detailed=True)
+
+        self.assertNotIn("وقت السعر:", compact)
+        self.assertNotIn("طلبات:", compact)
+        self.assertIn("أقرب دعم: 47.30", compact)
+        self.assertIn("وقت السعر:", detailed)
+        self.assertIn("طلبات:", detailed)
 
     def test_accepts_channel_post_for_public_reply(self):
         update = {

@@ -193,7 +193,9 @@ class SahmkProClient:
         if interval not in ("15min", "30min", "60min"):
             raise ValueError("Unsupported intraday interval")
         end = date.today()
-        start = end - timedelta(days=90)
+        # Pro permits up to 90 calendar days. 89 days plus both inclusive
+        # endpoints stays inside that limit; a 90-day subtraction spans 91 dates.
+        start = end - timedelta(days=89)
         return self._get(
             f"/historical/{symbol}/",
             {"interval": interval, "from": start.isoformat(), "to": end.isoformat(),

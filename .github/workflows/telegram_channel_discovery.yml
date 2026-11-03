@@ -1,0 +1,62 @@
+name: Discover Telegram Channel ID
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/telegram_channel_discovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover-channel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read bot updates without exposing token or message text
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          if not token:
+              raise RuntimeError("TELEGRAM_BOT_TOKEN secret missing")
+
+          query = urllib.parse.urlencode({
+              "timeout": 0,
+              "limit": 100,
+              "allowed_updates": json.dumps(["my_chat_member", "channel_post"]),
+          })
+          url = "https://api.telegram.org/bot" + token + "/getUpdates?" + query
+          with urllib.request.urlopen(url, timeout=20) as response:
+              payload = json.load(response)
+
+          if not payload.get("ok"):
+              raise RuntimeError("Telegram getUpdates failed")
+
+          channels = {}
+          for update in payload.get("result", []):
+              candidates = []
+              member = update.get("my_chat_member") or {}
+              if isinstance(member, dict):
+                  candidates.append(member.get("chat") or {})
+              post = update.get("channel_post") or {}
+              if isinstance(post, dict):
+                  candidates.append(post.get("chat") or {})
+              for chat in candidates:
+                  if chat.get("type") == "channel" and chat.get("id") is not None:
+                      channels[str(chat["id"])] = str(chat.get("title") or "channel")
+
+          if not channels:
+              raise RuntimeError("No channel update found; publish one channel post and rerun")
+
+          for chat_id, title in channels.items():
+              print("TELEGRAM_CHANNEL_FOUND id=" + chat_id + " title=" + title[:80])
+          PY

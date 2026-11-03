@@ -32,6 +32,10 @@ class TelegramTests(unittest.TestCase):
         }, clear=False):
             self.assertEqual(notification_targets(), ["1", "@public"])
 
+    def test_approved_channel_is_default_when_env_missing(self):
+        with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "1"}, clear=True):
+            self.assertEqual(notification_targets(), ["1", "-1003354695969"])
+
     def test_long_text_is_split(self):
         chunks = split_text("x" * 9000)
         self.assertTrue(all(len(x) <= 4000 for x in chunks))

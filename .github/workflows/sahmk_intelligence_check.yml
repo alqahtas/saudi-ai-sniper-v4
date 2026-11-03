@@ -1,0 +1,41 @@
+name: SAHMK Pro Intelligence Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  read-only-pro-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install runtime
+        run: pip install requests pandas numpy
+      - name: Verify approved Pro blocks without printing market payloads
+        env:
+          SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
+        run: |
+          python -u - <<'PY'
+          from sahmk_intelligence import fetch_intelligence, format_pro_sections
+
+          bundle = fetch_intelligence("2222")
+          available = sorted(bundle["data"])
+          errors = bundle["errors"]
+          print("SAHMK_PRO_BLOCKS_AVAILABLE=" + ",".join(available))
+          print("SAHMK_PRO_BLOCKS_UNAVAILABLE=" + ",".join(sorted(errors)))
+          for name in sorted(errors):
+              print("SAHMK_PRO_BLOCK_ERROR block=" + name + " reason=" + errors[name])
+
+          required = {"quote", "depth", "trades", "intraday", "ratios", "financials"}
+          missing = sorted(required - set(available))
+          if missing:
+              raise RuntimeError("Required approved Pro blocks unavailable: " + ",".join(missing))
+
+          rendered = format_pro_sections(bundle)
+          if "بيانات SAHMK Pro" not in rendered or "عمق السوق" not in rendered:
+              raise RuntimeError("Pro response formatter did not render expected sections")
+          print("SAHMK_PRO_INTELLIGENCE_OK symbol=2222")
+          PY

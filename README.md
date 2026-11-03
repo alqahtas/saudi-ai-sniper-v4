@@ -37,3 +37,26 @@ python -m unittest discover -s tests -v
 ```
 
 التحليل آلي لأغراض معلوماتية وليس توصية استثمارية.
+
+## SAHMK Pro intelligence
+
+The private Telegram analysis service now uses the approved SAHMK Pro access for:
+
+- Real-time quote and timestamp, with delayed-data labelling.
+- Top-5 market depth (/market/depth/{symbol}/) and bid/ask value imbalance.
+- Up to 100 recent executions and buy/sell aggressor flow.
+- Completed 60-minute candles for intraday trend and nearby levels.
+- Extended quarterly ratios and financial statements.
+- Dividends, TASI context, and important company events.
+- Independent block failures: a 403 plan/entitlement response disables only that block.
+
+Verified account capabilities from the read-only entitlement probes: Pro stock WebSocket connection (60 symbols per connection, 20 per subscription call) and approved top-5 depth snapshot. The bot intentionally requests no more than five depth levels.
+
+Configuration:
+
+- SAHMK_API_KEY — Northflank secret only.
+- SAHMK_GLOBAL_RATE_PER_MIN — default 300, hard-capped at 450 (Pro account limit is 500/min).
+- RATE_LIMIT_PER_MIN — private Telegram analysis requests per user, default 10.
+- Cache TTLs: quote/depth/trades 5s, TASI 30s, intraday 1h, financials/ratios/dividends 24h.
+
+This service supplies compact derived analysis. It does not place Saudi-market orders and does not redistribute a raw standalone market-data feed.

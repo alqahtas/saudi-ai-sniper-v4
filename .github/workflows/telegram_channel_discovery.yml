@@ -59,4 +59,19 @@ jobs:
 
           for chat_id, title in channels.items():
               print("TELEGRAM_CHANNEL_FOUND id=" + chat_id + " title=" + title[:80])
+              body = json.dumps({
+                  "chat_id": chat_id,
+                  "text": "✅ تم ربط قناة Saudi AI Sniper بنجاح. التنبيهات والتحليلات جاهزة.",
+              }, ensure_ascii=False).encode("utf-8")
+              request = urllib.request.Request(
+                  "https://api.telegram.org/bot" + token + "/sendMessage",
+                  data=body,
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=20) as sent:
+                  result = json.load(sent)
+              if not result.get("ok"):
+                  raise RuntimeError("Telegram channel delivery failed")
+              print("TELEGRAM_CHANNEL_DELIVERY_OK id=" + chat_id)
           PY

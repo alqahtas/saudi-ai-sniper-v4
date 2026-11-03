@@ -156,49 +156,38 @@ def _allowed(user_id, now=None):
 
 
 
-def compact_analysis(message):
-    """Return the decision-first Telegram reply; /details keeps the full report."""
+def _reply_sections(message):
+    """Split the generated report into core and SAHMK Pro sections."""
     lines = [line.strip() for line in str(message or "").splitlines() if line.strip()]
-    if not lines:
-        return ""
-
     try:
         pro_at = lines.index("📊 بيانات SAHMK Pro")
     except ValueError:
         pro_at = len(lines)
-    core, pro = lines[:pro_at], lines[pro_at + 1:]
+    return lines, lines[:pro_at], lines[pro_at + 1:]
 
-    def first(prefix, source=lines):
-        return next((line for line in source if line.startswith(prefix)), "")
 
-    def available_parts(line):
-        return [
-            part.strip() for part in line.split("|")
-            if part.strip() and "غير متوفر" not in part
-        ]
+def _first_line(prefix, source):
+    return next((line for line in source if line.startswith(prefix)), "")
 
-    title = core[0]
-    price = first("السعر:", core)
-    plan = first("🎯 الخطة:", core)
-    action = next((line for line in core if line.startswith(("ضع أمر", "لا تدخل"))), "")
-    stop = first("وقف الخسارة:", core)
-    target1 = first("الهدف الأول:", core)
-    target2 = first("الهدف الثاني:", core)
-    support_line = first("الدعوم:", core)
-    resistance_line = first("المقاومات:", core)
+
+def _available_parts(line):
+    return [
+        part.strip() for part in str(line or "").split("|")
+        if part.strip() and "غير متوفر" not in part
+    ]
+
+
+def _nearest_levels(core):
+    support_line = _first_line("الدعوم:", core)
+    resistance_line = _first_line("المقاومات:", core)
     support = support_line.split(":", 1)[1].split("،", 1)[0].strip() if ":" in support_line else ""
     resistance = resistance_line.split(":", 1)[1].split("،", 1)[0].strip() if ":" in resistance_line else ""
-    levels = (
-        f"🧱 أقرب دعم: {support} | أقرب مقاومة: {resistance}"
-        if support and resistance else ""
-    )
-    momentum = first("📈 الزخم:", core)
-    financial_label = first("💼 ماليًا:", core)
-    financial_bits = []
-    for prefix in ("P/E:", "ROE:"):
-        financial_bits.extend(available_parts(first(prefix, core)))
-    financial = " | ".join([part for part in [financial_label] + financial_bits if part])
+    if support and resistance:
+        return f"🧱 أقرب دعم: {support} | أقرب مقاومة: {resistance}"
+    return ""
 
+
+def _depth_summary(pro):
     depth_reading = next(
         (
             line.rstrip(".") for line in pro
@@ -210,22 +199,77 @@ def compact_analysis(message):
         ),
         "",
     )
-    spread = first("السبريد:", pro)
-    depth = "📚 " + " | ".join(
-        part for part in (depth_reading, spread) if part and "غير متوفر" not in part
-    ) if depth_reading or spread else ""
-    intraday = first("⏱️ فريم 60 دقيقة:", pro)
-    tasi = first("🇸🇦 تاسي:", pro)
+    spread = _first_line("السبريد:", pro)
+    parts = [
+        part for part in (depth_reading, spread)
+        if part and "غير متوفر" not in part
+    ]
+    return "📚 " + " | ".join(parts) if parts else ""
+
+
+def compact_analysis(message):
+    """Return a short, action-first opportunity reply."""
+    lines, core, pro = _reply_sections(message)
+    if not lines:
+        return ""
+
+    title = core[0]
+    price = _first_line("السعر:", core)
+    plan = _first_line("🎯 الخطة:", core)
+    action = next((line for line in core if line.startswith(("ضع أمر", "لا تدخل"))), "")
+    stop = _first_line("وقف الخسارة:", core)
+    target1 = _first_line("الهدف الأول:", core)
+    target2 = _first_line("الهدف الثاني:", core)
+    momentum = _first_line("📈 الزخم:", core)
     condition = next((line for line in core if line.startswith("الخطة مشروطة")), "")
-    disclaimer = first("تحليل آلي", core)
+    disclaimer = _first_line("تحليل آلي", core)
 
     compact = [
-        title, price, plan, action,
+        title,
+        price,
+        plan,
+        action,
         " | ".join(part for part in (stop, target1, target2) if part),
-        levels, momentum, financial, depth, intraday, tasi,
-        condition, disclaimer,
+        _nearest_levels(core),
+        momentum,
+        _depth_summary(pro),
+        condition,
+        disclaimer,
     ]
     return "\n".join(line for line in compact if line)
+
+
+def overview_analysis(message):
+    """Return a broad market/financial view without presenting a trade order."""
+    lines, core, pro = _reply_sections(message)
+    if not lines:
+        return ""
+
+    title = core[0]
+    price = _first_line("السعر:", core)
+    momentum = _first_line("📈 الزخم:", core)
+    financial_label = _first_line("💼 ماليًا:", core)
+    financial_bits = []
+    for prefix in ("P/E:", "ROE:"):
+        financial_bits.extend(_available_parts(_first_line(prefix, core)))
+    financial = " | ".join(
+        part for part in [financial_label] + financial_bits if part
+    )
+    tasi = _first_line("🇸🇦 تاسي:", pro)
+    disclaimer = _first_line("تحليل آلي", core)
+
+    overview = [
+        title,
+        price,
+        "🧭 نظرة شاملة للسهم — وليست خطة دخول",
+        _nearest_levels(core),
+        momentum,
+        financial,
+        _depth_summary(pro),
+        tasi,
+        disclaimer,
+    ]
+    return "\n".join(line for line in overview if line)
 
 
 def analyze_company(company, detailed=False, opportunity=False):
@@ -279,7 +323,12 @@ def analyze_company(company, detailed=False, opportunity=False):
         )
 
     table = format_timeframe_table(candles, intelligence, opportunity=opportunity)
-    reply = message if detailed else compact_analysis(message)
+    if detailed:
+        reply = message
+    elif opportunity:
+        reply = compact_analysis(message)
+    else:
+        reply = overview_analysis(message)
     if table:
         reply += "\n\n" + table
     LOG.info(

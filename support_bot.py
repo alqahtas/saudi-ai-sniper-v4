@@ -16,6 +16,7 @@ import requests
 
 from fundamental_engine import analyze as fundamental_analysis
 from market_scanner import BASE_URL, sahmk_session
+from sahmk_intelligence import fetch_intelligence, format_pro_sections
 from sniper_core import daily
 from stock_advisor import build_recommendation, format_recommendation
 from telegram_delivery import send_message
@@ -175,6 +176,13 @@ def analyze_company(company):
     message = format_recommendation(symbol, name, plan, quote, fundamentals)
     if quote.get("is_delayed") is True:
         message = "⏱️ تنبيه: السعر مزوّد كبيانات متأخرة.\n" + message
+
+    try:
+        intelligence = fetch_intelligence(symbol)
+        message += format_pro_sections(intelligence)
+    except Exception as exc:
+        LOG.warning("pro_intelligence_failed symbol=%s error=%s", symbol, type(exc).__name__)
+        message += "\n\n📊 بيانات SAHMK Pro: تعذر جلبها مؤقتًا، والتحليل الأساسي أعلاه ما زال صالحًا."
     return message
 
 
@@ -194,7 +202,8 @@ def _help():
         "أرسل اسم الشركة أو رمزها، مثل:\n"
         "أرامكو\n2222\nالراجحي\nstc\n\n"
         "سأعطيك سعرًا، دعومًا ومقاومات، زخمًا، وضعًا ماليًا، "
-        "وأمر LIMIT مقترحًا مع وقف 2% وهدفين وتصنيف مدة الصفقة."
+        "وأمر LIMIT مقترحًا مع وقف 2% وهدفين وتصنيف مدة الصفقة، "
+        "مع عمق السوق والتنفيذات وفريم 60 دقيقة والبيانات المالية الموسعة."
     )
 
 

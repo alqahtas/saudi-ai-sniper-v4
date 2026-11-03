@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 
 from sahmk_intelligence import (
     CACHE, GLOBAL_CALLS, PlanLimitError, SahmkProClient, depth_metrics,
@@ -28,6 +29,8 @@ class FakeSession:
 
     def get(self, *args, **kwargs):
         self.calls += 1
+        self.last_args = args
+        self.last_kwargs = kwargs
         return self.responses.pop(0)
 
 
@@ -103,6 +106,16 @@ class SahmkIntelligenceTests(unittest.TestCase):
         self.assertEqual(result["support"], 9.0)
         self.assertEqual(result["resistance"], 10.6)
         self.assertEqual(result["trend"], "صاعد")
+
+    def test_intraday_window_stays_within_pro_limit(self):
+        session = FakeSession([FakeResponse(200, {"candles": []})])
+        client = SahmkProClient(session=session, sleep=lambda _: None, now=lambda: 1000)
+        client.intraday("2222")
+        params = session.last_kwargs["params"]
+        start = date.fromisoformat(params["from"])
+        end = date.fromisoformat(params["to"])
+        self.assertLessEqual((end - start).days + 1, 90)
+        self.assertEqual(params["interval"], "60min")
 
     def test_429_honours_retry_after_then_succeeds(self):
         waits = []

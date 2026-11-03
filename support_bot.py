@@ -16,6 +16,7 @@ import requests
 
 from fundamental_engine import analyze as fundamental_analysis
 from market_scanner import BASE_URL, sahmk_session
+from sahmk_intelligence import fetch_intelligence, format_pro_sections
 from sniper_core import daily
 from stock_advisor import build_recommendation, format_recommendation
 from telegram_delivery import send_message

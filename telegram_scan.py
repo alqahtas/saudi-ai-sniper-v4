@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import requests
 from market_scanner import run
 from sahmk_pro import tasi_market
+from telegram_delivery import broadcast, notification_targets
 
 TZ = ZoneInfo("Asia/Riyadh")
 STATE_FILE = Path(os.getenv("ALERT_STATE_FILE", "alert_state.json"))
@@ -78,14 +79,11 @@ def market_status():
 
 
 def send_telegram(token, chat_id, message):
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": message},
-        timeout=30,
-    )
-    response.raise_for_status()
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram rejected message")
+    """Compatibility wrapper: notifications go to owner and public channel."""
+    targets = notification_targets()
+    if chat_id and str(chat_id) not in targets:
+        targets.insert(0, str(chat_id))
+    return broadcast(message, token=token, targets=targets)
 
 
 def load_sent():
@@ -120,8 +118,8 @@ def session_open(now):
 def scan_once():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+    if not token or not notification_targets():
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or Telegram notification target")
 
     now = datetime.now(TZ)
     market = market_status()

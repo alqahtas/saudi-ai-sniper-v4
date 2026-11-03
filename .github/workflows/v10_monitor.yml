@@ -107,9 +107,11 @@ jobs:
           SAHMK_API_KEY: ${{ secrets.SAHMK_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
         run: |
-          test -n "$TELEGRAM_BOT_TOKEN" && test -n "$TELEGRAM_CHAT_ID" || {
-            echo "::error::Telegram secrets not configured"; exit 1;
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo "::error::Telegram token missing"; exit 1; }
+          { test -n "$TELEGRAM_CHAT_ID" || test -n "$TELEGRAM_CHANNEL_ID"; } || {
+            echo "::error::Telegram owner/channel target missing"; exit 1;
           }
           python -u v10_live_monitor.py --once
 

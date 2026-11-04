@@ -45,6 +45,9 @@ jobs:
         run: |
           python -m py_compile v10_live_monitor.py
 
+      - name: Verify public alert formatting and delivery offline
+        run: python -m unittest discover -s tests -v
+
       - name: Restore latest V10 watchlist
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,3 +136,4 @@ jobs:
           name: v10-diagnostics
           path: v10_watchlist.json
           if-no-files-found: ignore
+

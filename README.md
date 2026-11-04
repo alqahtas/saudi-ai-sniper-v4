@@ -60,3 +60,14 @@ Configuration:
 - Cache TTLs: quote/depth/trades 5s, TASI 30s, intraday 1h, financials/ratios/dividends 24h.
 
 This service supplies compact derived analysis. It does not place Saudi-market orders and does not redistribute a raw standalone market-data feed.
+
+
+## التنبيهات العامة المختصرة
+
+- تنبيه واحد لكل سهم وحالة، مع أقرب مستوى فعلي ووقت الرياض بدل التاريخ الخام.
+- تُدمج مستويات الدعم المكسورة، ولا يعاد نفس النوع والمستوى خلال اليوم إلا بعد تغير الحالة.
+- بيانات السعر يجب أن تكون حديثة وأن يصرح سهمك `is_delayed=false`.
+- لمس الدعم أو تجاوز المقاومة ليس دخولًا مؤكدًا: يلزم إغلاق 15 دقيقة نهائي وحجم داعم؛ المراقب الحالي لا يثبت ذلك فلا يسميه فرصة مؤكدة ولا يختلق أهدافًا.
+- يرسل للمالك وللقناة المعتمدة. قيمة `TELEGRAM_CHANNEL_ID` الفارغة في Actions تستخدم القناة المعتمدة بدل تعطيل مسارها.
+- لا يسجل نجاح التنبيه إذا فشلت إحدى الوجهات. سجل `Telegram delivery OK target=...` دليل قبول Telegram للرسالة، وليس دليل قراءة الأعضاء.
+- الحالة المستمرة محفوظة في artifact `v10-alert-state` بين دورات Actions. لا يحتاج هذا المسار polling إضافيًا.

@@ -35,7 +35,7 @@ def notification_targets():
     """Return de-duplicated owner and optional channel targets."""
     values = (
         os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-        os.getenv("TELEGRAM_CHANNEL_ID", DEFAULT_CHANNEL_ID).strip(),
+        (os.getenv("TELEGRAM_CHANNEL_ID", "").strip() or DEFAULT_CHANNEL_ID),
     )
     return list(dict.fromkeys(value for value in values if value))
 
@@ -80,9 +80,11 @@ def broadcast(text, *, token=None, targets=None):
         try:
             send_message(token, target, text)
             result[str(target)] = True
+            LOG.info("Telegram delivery OK target=%s", target)
         except Exception as exc:
             LOG.error("Telegram delivery failed target=%s error=%s", target, type(exc).__name__)
             result[str(target)] = False
     if not any(result.values()):
         raise RuntimeError("Telegram delivery failed for every configured target")
     return result
+

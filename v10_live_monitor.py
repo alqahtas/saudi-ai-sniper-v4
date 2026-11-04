@@ -165,6 +165,9 @@ def fetch_quote(s, symbol):
         response.raise_for_status()
         data = response.json()
 
+        if find_value(data, ("is_delayed",)) is not False:
+            return None, "realtime_not_verified"
+
         price_raw = find_value(
             data,
             ("last", "last_price", "lastPrice",
@@ -215,7 +218,7 @@ def fetch_quote(s, symbol):
 def telegram_send(message):
     try:
         result = broadcast(message)
-        return any(result.values())
+        return bool(result) and all(result.values())
     except Exception as exc:
         LOG.error("Telegram error: %s", type(exc).__name__)
         return False
@@ -326,7 +329,38 @@ def evaluate(symbol, stock, quote):
             ),
         })
 
-    return events
+    # A higher historical support already broken is not a separate alert.
+    # Prefer the currently touched zone, then the nearest broken support.
+    touches = [e for e in events if e["type"] == "SUPPORT_TOUCH"]
+    breaks = [e for e in events if e["type"] == "SUPPORT_BREAK"]
+    if touches:
+        chosen = min(touches, key=lambda e: abs(e["level"] - price))
+    elif breaks:
+        chosen = min(breaks, key=lambda e: e["level"])
+    elif events:
+        chosen = events[0]
+    else:
+        return []
+    chosen["key"] = f"{symbol}:{chosen['type']}:{chosen['level']:.4f}"
+    label = {"SUPPORT_TOUCH": "🔎 مراقبة دعم — الدخول غير مؤكد",
+             "SUPPORT_BREAK": "⚠️ ضعف فني — كسر دعم",
+             "BREAKOUT_WATCH": "📈 اختراق مبدئي — للمراقبة"}[chosen["type"]]
+    level_label = "المقاومة" if chosen["type"] == "BREAKOUT_WATCH" else "أقرب دعم مرجعي"
+    gap = (price / chosen["level"] - 1) * 100
+    condition = {
+        "SUPPORT_TOUCH": "التأكيد: ارتداد بشمعة 15 دقيقة نهائية وحجم داعم؛ اللمس وحده ليس دخولًا.",
+        "SUPPORT_BREAK": "الحالة: لا دخول اعتمادًا على هذا الدعم؛ يلزم استعادته وتأكيد الثبات.",
+        "BREAKOUT_WATCH": "التأكيد: إغلاق 15 دقيقة نهائي أعلى المقاومة وحجم داعم؛ تجنّب المطاردة.",
+    }[chosen["type"]]
+    chosen["message"] = (f"{label}\nالشركة: {display_name} ({symbol})\n"
+                         f"السعر: {price:.2f} ريال\n{level_label}: {chosen['level']:.2f} ريال ({gap:+.2f}%)\n"
+                         f"{condition}\nالدخول غير مؤكد؛ قراءة السعر وحدها لا تكفي.")
+    return [chosen]
+
+
+def price_time_label(value):
+    stamp = parse_timestamp(value)
+    return stamp.astimezone(RIYADH).strftime("%d/%m/%Y • %H:%M:%S بتوقيت الرياض") if stamp else "وقت غير متحقق"
 
 
 def process_events(events, state, quote):
@@ -339,6 +373,12 @@ def process_events(events, state, quote):
 
     for event in events:
         key = event["key"]
+        # Persist a daily semantic fingerprint, independent of quote/zone index.
+        fingerprint_key = f"last_alert:{quote['symbol']}"
+        fingerprint = {"date": current.astimezone(RIYADH).date().isoformat(),
+                       "type": event["type"], "level": event.get("level")}
+        if state.get(fingerprint_key) == fingerprint:
+            continue
         last = parse_timestamp(state.get(key))
 
         if last is not None:
@@ -348,7 +388,7 @@ def process_events(events, state, quote):
 
         message = (
             event["message"]
-            + f"\nوقت السعر: {quote['timestamp']}"
+            + f"\n🕒 {price_time_label(quote['timestamp'])}\nالمصدر: سهمك Pro • تنبيه معلوماتي وليس أمر بيع أو شراء"
         )
 
         delivered = telegram_send(message)
@@ -366,6 +406,7 @@ def process_events(events, state, quote):
 
         history.append(record)
         state[key] = current.isoformat()
+        state[fingerprint_key] = fingerprint
         changed = True
         LOG.info("%s", message.replace("\n", " | "))
 
@@ -509,3 +550,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -497,6 +497,8 @@ def scan_ema_alerts(s, candidates, state):
                 f"السعر: {quote['price']:.2f} ريال\n"
                 f"خط الدخول المشروط: {setup.entry:.2f} ريال\n"
                 f"أقرب دعم ووقف تقديري: {setup.stop:.2f} ريال\n"
+                f"فيبو تصحيحي {setup.fib.ratio * 100:.1f}% عند {setup.fib.retracement:.2f} ريال\n"
+                f"امتداد 138.2% / 150% / 161.8%: {' / '.join(f'{level:.2f}' for level in setup.fib.extensions)} ريال\n"
                 f"EMA 25/75/140 صاعدة على الساعة و15د | RSI 14 صاعد {setup.strength:.1f}\n"
                 f"تأكيد شمعة 15د: {setup.confirmed_at:%H:%M} بتوقيت الرياض | تاسي إيجابي\n"
                 "مراقبة إعادة اختبار الخط."

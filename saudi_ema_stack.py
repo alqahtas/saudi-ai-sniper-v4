@@ -5,6 +5,7 @@ import math
 
 import pandas as pd
 
+from fibonacci import FibonacciConfluence, confluence
 from saudi_intraday_engine import completed_candles
 from timeframe_analysis import _rsi
 
@@ -20,6 +21,7 @@ class EmaRetest:
     stop: float
     strength: float
     confirmed_at: pd.Timestamp
+    fib: FibonacciConfluence
 
 
 def _session_candles(payload, minutes, now):
@@ -90,4 +92,8 @@ def evaluate(hourly_payload, fifteen_payload, quote_price, quote_stamp, now):
     stop = _nearest_support(hourly, fifteen, entry)
     if stop is None or round(stop, 2) >= round(entry, 2):
         return None
-    return EmaRetest(entry=entry, stop=stop, strength=strength, confirmed_at=confirmed.tz_convert(RIYADH))
+    swing = hourly.tail(42)
+    fib = confluence(swing["High"].to_list(), swing["Low"].to_list(), "LONG", format(entry, ".15g"))
+    if fib is None:
+        return None
+    return EmaRetest(entry=entry, stop=stop, strength=strength, confirmed_at=confirmed.tz_convert(RIYADH), fib=fib)

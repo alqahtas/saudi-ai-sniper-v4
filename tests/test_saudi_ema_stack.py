@@ -28,6 +28,9 @@ def bars(minutes):
     frame = pd.DataFrame({"Open": closes, "High": [v+.015 for v in closes],
                           "Low": [v-.015 for v in closes], "Close": closes, "Volume": 100},
                          index=index)
+    if minutes == 60:
+        frame.loc[index[-25], "Low"] = 98.625
+        frame.loc[index[-7], "High"] = 100.85
     if minutes == 15:
         frame.loc[index[-15], "Low"] = 99.95
         frame.loc[index[-8], "Low"] = 99.88
@@ -49,6 +52,10 @@ class SaudiEmaTests(unittest.TestCase):
         self.assertEqual(setup.stop, 99.95)
         self.assertGreater(setup.strength, 50)
         self.assertEqual(setup.confirmed_at.strftime("%H:%M"), "12:30")
+
+    def test_fibonacci_must_overlap_the_hourly_ema(self):
+        self.hourly.loc[self.hourly.index[-7], "High"] = 103.00
+        self.assertIsNone(self.signal())
 
     def test_forming_bar_cannot_change_confirmation(self):
         expected = self.signal()
@@ -91,6 +98,8 @@ class SaudiEmaTests(unittest.TestCase):
             self.assertEqual(event["type"], "EMA_STACK_RETEST")
             self.assertIn("أرامكو", event["message"])
             self.assertIn("99.95", event["message"])
+            self.assertIn("38.2%", event["message"])
+            self.assertIn("138.2% / 150% / 161.8%", event["message"])
             self.assertEqual([call.args[1] for call in client.intraday.call_args_list], ["60min", "15min"])
             client.market.return_value["is_delayed"] = True
             deliver.reset_mock()

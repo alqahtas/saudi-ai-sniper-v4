@@ -7,6 +7,10 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/v10_monitor.yml'
+      - 'v10_live_monitor.py'
+      - 'saudi_ema_stack.py'
+      - 'fibonacci.py'
+      - 'sahmk_intelligence.py'
   schedule:
     # Riyadh 10:15 through 14:45, Sunday-Thursday
     # GitHub cron uses UTC

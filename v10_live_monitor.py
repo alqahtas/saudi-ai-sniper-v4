@@ -14,6 +14,7 @@ No automatic orders. No fabricated prices.
 import argparse
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,8 @@ from pathlib import Path
 
 import requests
 
+from sahmk_intelligence import SahmkProClient
+from saudi_ema_stack import evaluate as evaluate_ema_retest
 from telegram_delivery import broadcast
 
 LOG = logging.getLogger("V10")
@@ -42,6 +45,8 @@ POLL_SECONDS = max(
 ALERT_COOLDOWN = 1800
 MAX_QUOTE_AGE = 180
 REQUEST_TIMEOUT = 15
+EMA_SCAN_LIMIT = 10
+EMA_SCAN_BUDGET_SECONDS = 45
 
 
 def now_utc():
@@ -179,7 +184,7 @@ def fetch_quote(s, symbol):
 
         price = float(str(price_raw).replace(",", ""))
 
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             return None, "invalid_price"
 
         timestamp_raw = find_value(
@@ -202,9 +207,15 @@ def fetch_quote(s, symbol):
         if age > MAX_QUOTE_AGE:
             return None, f"stale_quote_{int(age)}s"
 
+        turnover_raw = find_value(data, ("turnover", "traded_value", "total_value"))
+        try:
+            turnover = float(str(turnover_raw).replace(",", ""))
+        except (ValueError, TypeError):
+            turnover = 0.0
         return {
             "symbol": symbol,
             "price": price,
+            "turnover": turnover if math.isfinite(turnover) and turnover > 0 else 0.0,
             "timestamp": stamp.isoformat(),
             "age_seconds": round(age, 1),
         }, None
@@ -375,6 +386,8 @@ def process_events(events, state, quote):
         key = event["key"]
         # Persist a daily semantic fingerprint, independent of quote/zone index.
         fingerprint_key = f"last_alert:{quote['symbol']}"
+        if event["type"] == "EMA_STACK_RETEST":
+            fingerprint_key += ":ema_stack"
         fingerprint = {"date": current.astimezone(RIYADH).date().isoformat(),
                        "type": event["type"], "level": event.get("level")}
         if state.get(fingerprint_key) == fingerprint:
@@ -417,6 +430,84 @@ def process_events(events, state, quote):
     return changed
 
 
+def ema_market_positive(payload, now):
+    if find_value(payload, ("is_delayed",)) is not False:
+        return False
+    stamp = parse_timestamp(find_value(payload, ("updated_at", "timestamp", "last_update", "index_updated_at")))
+    if stamp is None or not -60 <= (now - stamp).total_seconds() <= MAX_QUOTE_AGE:
+        return False
+    try:
+        change = float(find_value(payload, ("index_change_percent", "change_percent")))
+        advancing = int(find_value(payload, ("advancing", "gainers")))
+        declining = int(find_value(payload, ("declining", "losers")))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(change) and change > 0 and declining >= 0 and advancing > 1.4 * declining
+
+
+def scan_ema_alerts(s, candidates, state):
+    local = now_saudi()
+    if not candidates or not market_open() or local.hour < 11:
+        return 0
+    client = SahmkProClient(session=s)
+    try:
+        market = client.market()
+        if not ema_market_positive(market, now_utc()):
+            LOG.info("EMA STACK HOLD | TASI not verified positive")
+            return 0
+    except Exception as exc:
+        LOG.warning("EMA STACK HOLD | TASI error=%s", type(exc).__name__)
+        return 0
+
+    started = time.monotonic()
+    ranked = sorted(candidates, key=lambda item: item[1].get("turnover", 0), reverse=True)
+    sent = 0
+    for stock, quote in ranked[:EMA_SCAN_LIMIT]:
+        if time.monotonic() - started >= EMA_SCAN_BUDGET_SECONDS:
+            break
+        symbol = quote["symbol"]
+        try:
+            hourly = client.intraday(symbol, "60min", recent=True)
+            fifteen = client.intraday(symbol, "15min", recent=True)
+            stamp = parse_timestamp(quote["timestamp"])
+            current = now_utc()
+            latest_close = current.replace(minute=current.minute // 15 * 15, second=0, microsecond=0)
+            if stamp is None or stamp < latest_close or (current - stamp).total_seconds() > MAX_QUOTE_AGE:
+                quote, error = fetch_quote(s, symbol)
+                if error:
+                    continue
+                stamp = parse_timestamp(quote["timestamp"])
+            if stamp is None:
+                continue
+            setup = evaluate_ema_retest(hourly, fifteen, quote["price"], stamp, now_utc())
+        except Exception as exc:
+            LOG.warning("EMA STACK DATA HOLD | symbol=%s error=%s", symbol, type(exc).__name__)
+            continue
+        if setup is None:
+            continue
+        if not ema_market_positive(market, now_utc()):
+            break
+        event = {
+            "type": "EMA_STACK_RETEST",
+            "key": f"{symbol}:EMA_STACK_RETEST:{setup.confirmed_at.isoformat()}",
+            "level": round(setup.entry, 2),
+            "message": (
+                "📈 Saudi AI Sniper | إعادة اختبار EMA 25\n"
+                f"الشركة: {company_display_name(symbol, stock)} ({symbol})\n"
+                f"السعر: {quote['price']:.2f} ريال\n"
+                f"خط الدخول المشروط: {setup.entry:.2f} ريال\n"
+                f"أقرب دعم ووقف تقديري: {setup.stop:.2f} ريال\n"
+                f"فيبو تصحيحي {setup.fib.ratio * 100:.1f}% عند {setup.fib.retracement:.2f} ريال\n"
+                f"امتداد 138.2% / 150% / 161.8%: {' / '.join(f'{level:.2f}' for level in setup.fib.extensions)} ريال\n"
+                f"EMA 25/75/140 صاعدة على الساعة و15د | RSI 14 صاعد {setup.strength:.1f}\n"
+                f"تأكيد شمعة 15د: {setup.confirmed_at:%H:%M} بتوقيت الرياض | تاسي إيجابي\n"
+                "مراقبة إعادة اختبار الخط."
+            ),
+        }
+        sent += int(process_events([event], state, quote))
+    return sent
+
+
 def scan_once(force=False):
     if not force and not market_open():
         LOG.info("Saudi market is closed; no live alerts")
@@ -445,6 +536,7 @@ def scan_once(force=False):
     valid = 0
     alerts = 0
     errors = {}
+    ema_candidates = []
 
     LOG.info(
         "V10.1 started | universe=%s | watched=%s",
@@ -460,15 +552,17 @@ def scan_once(force=False):
             continue
 
         valid += 1
+        ema_candidates.append((stock, quote))
         events = evaluate(symbol, stock, quote)
 
         if events and process_events(events, state, quote):
             alerts += 1
 
+    ema_alerts = scan_ema_alerts(s, ema_candidates, state)
     LOG.info(
         "Completed | watched=%d | fresh_quotes=%d | "
-        "stocks_with_alerts=%d | errors=%d",
-        total, valid, alerts, len(errors),
+        "stocks_with_alerts=%d | ema_alerts=%d | errors=%d",
+        total, valid, alerts, ema_alerts, len(errors),
     )
 
     if errors:

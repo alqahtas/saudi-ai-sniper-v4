@@ -8,7 +8,8 @@ import math
 import os
 import time
 from collections import deque
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -189,18 +190,19 @@ class SahmkProClient:
         return self._get(f"/market/trades/{symbol}/", {"limit": limit},
                          cache_key=f"trades:{symbol}:{limit}", ttl=TTLS["trades"])
 
-    def intraday(self, symbol, interval="60min"):
+    def intraday(self, symbol, interval="60min", *, recent=False):
         if interval not in ("15min", "30min", "60min"):
             raise ValueError("Unsupported intraday interval")
-        end = date.today()
-        # Pro permits up to 90 calendar days. 89 days plus both inclusive
-        # endpoints stays inside that limit; a 90-day subtraction spans 91 dates.
-        start = end - timedelta(days=89)
+        end = datetime.now(ZoneInfo("Asia/Riyadh")).date() if recent else date.today()
+        # SAHMK paginates oldest first. A 28-day 15m window fits in one
+        # 500-row page and reaches the current session during continuous trading.
+        days = 27 if recent and interval == "15min" else 89
+        start = end - timedelta(days=days)
         return self._get(
             f"/historical/{symbol}/",
             {"interval": interval, "from": start.isoformat(), "to": end.isoformat(),
              "limit": 500, "offset": 0},
-            cache_key=f"intraday:{symbol}:{interval}", ttl=TTLS["intraday"],
+            cache_key=f"intraday:{symbol}:{interval}:{recent}", ttl=45 if recent else TTLS["intraday"],
         )
 
     def company(self, symbol):

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import requests
 
+from chart_indicators import describe as describe_chart
 from sahmk_intelligence import SahmkProClient
 from saudi_ema_stack import evaluate as evaluate_ema_retest
 from telegram_delivery import broadcast
@@ -491,6 +492,7 @@ def scan_ema_alerts(s, candidates, state):
             "type": "EMA_STACK_RETEST",
             "key": f"{symbol}:EMA_STACK_RETEST:{setup.confirmed_at.isoformat()}",
             "level": round(setup.entry, 2),
+            "chart_indicators": setup.chart_indicators,
             "message": (
                 "📈 Saudi AI Sniper | إعادة اختبار EMA 25\n"
                 f"الشركة: {company_display_name(symbol, stock)} ({symbol})\n"
@@ -499,6 +501,7 @@ def scan_ema_alerts(s, candidates, state):
                 f"أقرب دعم ووقف تقديري: {setup.stop:.2f} ريال\n"
                 f"فيبو تصحيحي {setup.fib.ratio * 100:.1f}% عند {setup.fib.retracement:.2f} ريال\n"
                 f"امتداد 138.2% / 150% / 161.8%: {' / '.join(f'{level:.2f}' for level in setup.fib.extensions)} ريال\n"
+                f"فيبو الشارت 0/23.6/38.2/78.6/100 وامتداد ثلاثي 127.2%: {describe_chart(setup.chart_indicators['1h'])}\n"
                 f"EMA 25/75/140 صاعدة على الساعة و15د | RSI 14 صاعد {setup.strength:.1f}\n"
                 f"تأكيد شمعة 15د: {setup.confirmed_at:%H:%M} بتوقيت الرياض | تاسي إيجابي\n"
                 "مراقبة إعادة اختبار الخط."
@@ -644,4 +647,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

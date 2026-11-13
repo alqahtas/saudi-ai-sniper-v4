@@ -11,6 +11,8 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+
+from chart_indicators import analyze as chart_analysis, frame_rows
 import requests
 
 LOG = logging.getLogger(__name__)
@@ -253,7 +255,7 @@ def indicators(data):
     l = x["Low"]
     v = x["Volume"]
 
-    for period in (20, 50, 100):
+    for period in (20, 25, 50, 75, 100, 140):
         x[f"ema{period}"] = c.ewm(
             span=period,
             adjust=False
@@ -718,6 +720,7 @@ def calculate(data, ticker=None, *args, **kwargs):
     )
 
     return {
+        "chart_indicators": chart_analysis(frame_rows(x)),
         "السهم": str(ticker or ""),
         "الرمز": str(ticker or ""),
         "التاريخ": candle_date,
@@ -787,3 +790,4 @@ if __name__ == "__main__":
     print("LIQUIDITY:", result["السيولة"])
     print("SCORE:", result["درجة_الجودة"])
     print("STATUS:", result["الحالة"])
+

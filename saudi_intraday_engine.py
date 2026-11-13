@@ -4,7 +4,8 @@ The module deliberately has no scheduler, Telegram sender, or order methods.
 It scans once when called and returns conditional setups based on completed
 15-minute candles, live quotes, top-5 depth, and recent aggressor flow.
 """
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from chart_indicators import analyze as chart_analysis, frame_rows
 from datetime import datetime, timedelta, timezone
 import math
 
@@ -36,6 +37,7 @@ class SaudiIntradaySetup:
     next_resistance: float | None
     score: int
     evidence: tuple[str, ...]
+    chart_indicators: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
@@ -236,6 +238,7 @@ def evaluate_setup(symbol, company, candles, quote_payload, depth_payload,
         resistance=round(resistance, 2),
         next_resistance=round(next_resistance, 2) if next_resistance else None,
         score=min(score, 95), evidence=evidence,
+        chart_indicators=chart_analysis(frame_rows(data)),
     )
 
 
@@ -289,3 +292,4 @@ def scan_once(deep_limit=DEEP_SCAN_LIMIT, now=None):
         "errors": errors,
         "read_only": True,
     }
+

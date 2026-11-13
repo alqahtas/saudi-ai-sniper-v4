@@ -65,7 +65,7 @@ def advanced_features(frame):
     c = series(x, "Close")
     v = series(x, "Volume").clip(lower=0)
 
-    for n in (9, 20, 50, 100, 200):
+    for n in (9, 20, 25, 50, 75, 100, 140, 200):
         x[f"ema{n}"] = ema(c, n)
 
     x["rsi14"] = rsi(c)
@@ -440,3 +440,4 @@ def candidate_signals(frame):
         ).fillna(False).astype(bool)
         for name, signal in signals.items()
     }
+

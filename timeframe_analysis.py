@@ -3,6 +3,8 @@ import math
 
 import pandas as pd
 
+from chart_indicators import analyze as chart_analysis, frame_rows
+
 
 def _number(value):
     try:
@@ -203,6 +205,7 @@ def summarize_frame(frame):
     if None in (support, resistance):
         return None
     return {
+        "chart_indicators": chart_analysis(frame_rows(data)),
         "trend": trend,
         "rsi": round(rsi, 1),
         "support": round(support, 2),
@@ -255,3 +258,4 @@ def format_timeframe_table(daily, intelligence, opportunity=False):
         "الفريم | الاتجاه | RSI | الدعم | المقاومة",
         *rows,
     ])
+

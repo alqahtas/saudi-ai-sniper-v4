@@ -1,5 +1,6 @@
 """Long-only EMA retest alerts using completed Saudi cash-session candles."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from chart_indicators import analyze as chart_analysis, frame_rows
 from datetime import time
 import math
 
@@ -22,6 +23,7 @@ class EmaRetest:
     strength: float
     confirmed_at: pd.Timestamp
     fib: FibonacciConfluence
+    chart_indicators: dict = field(default_factory=dict)
 
 
 def _session_candles(payload, minutes, now):
@@ -96,4 +98,7 @@ def evaluate(hourly_payload, fifteen_payload, quote_price, quote_stamp, now):
     fib = confluence(swing["High"].to_list(), swing["Low"].to_list(), "LONG", format(entry, ".15g"))
     if fib is None:
         return None
-    return EmaRetest(entry=entry, stop=stop, strength=strength, confirmed_at=confirmed.tz_convert(RIYADH), fib=fib)
+    return EmaRetest(entry=entry, stop=stop, strength=strength, confirmed_at=confirmed.tz_convert(RIYADH), fib=fib,
+                     chart_indicators={"1h": chart_analysis(frame_rows(hourly)),
+                                       "15m": chart_analysis(frame_rows(fifteen))})
+

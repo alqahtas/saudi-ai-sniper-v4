@@ -25,6 +25,7 @@ import requests
 from sahmk_intelligence import SahmkProClient
 from saudi_ema_stack import evaluate as evaluate_ema_retest
 from telegram_delivery import broadcast
+from saudi_fib import evaluate as evaluate_fib
 
 LOG = logging.getLogger("V10")
 RIYADH = timezone(timedelta(hours=3))
@@ -386,8 +387,8 @@ def process_events(events, state, quote):
         key = event["key"]
         # Persist a daily semantic fingerprint, independent of quote/zone index.
         fingerprint_key = f"last_alert:{quote['symbol']}"
-        if event["type"] == "EMA_STACK_RETEST":
-            fingerprint_key += ":ema_stack"
+        if event["type"] in ("EMA_STACK_RETEST", "FIB_H1_M15"):
+            fingerprint_key += ":ema_stack" if event["type"] == "EMA_STACK_RETEST" else ":fib_h1_m15"
         fingerprint = {"date": current.astimezone(RIYADH).date().isoformat(),
                        "type": event["type"], "level": event.get("level")}
         if state.get(fingerprint_key) == fingerprint:
@@ -443,6 +444,58 @@ def ema_market_positive(payload, now):
     except (TypeError, ValueError, OverflowError):
         return False
     return math.isfinite(change) and change > 0 and declining >= 0 and advancing > 1.4 * declining
+
+
+
+def scan_fib_alerts(s, candidates, state):
+    """Primary versioned signal path. Legacy scan_ema_alerts remains for audit."""
+    if not candidates or not market_open() or now_saudi().hour < 11:
+        return 0
+    client = SahmkProClient(session=s)
+    try:
+        market = client.market()
+        if not ema_market_positive(market, now_utc()):
+            return 0
+    except Exception as exc:
+        LOG.warning("FIB HOLD | market error=%s", type(exc).__name__)
+        return 0
+    started, sent = time.monotonic(), 0
+    ranked = sorted(candidates,key=lambda item:item[1].get("turnover",0),reverse=True)
+    for stock, quote in ranked[:EMA_SCAN_LIMIT]:
+        if time.monotonic()-started >= EMA_SCAN_BUDGET_SECONDS:
+            break
+        symbol = quote["symbol"]
+        try:
+            hour = client.intraday(symbol,"60min",recent=True)
+            lower = client.intraday(symbol,"15min",recent=True)
+            stamp = parse_timestamp(quote["timestamp"])
+            if stamp is None:
+                continue
+            setup = evaluate_fib(hour,lower,quote["price"],stamp,now_utc(),
+                                 fee_rate=os.getenv("SAUDI_ESTIMATED_FEE_RATE","0.0017825"))
+            if setup is None:
+                continue
+            plan = setup.plan
+            if not ema_market_positive(market,now_utc()):
+                break
+            anchors = " ← ".join(str(p.price) for p in plan.drawing.anchors)
+            event = dict(type="FIB_H1_M15",level=float(plan.entry),
+                         key=f"{symbol}:FIB_H1_M15:{plan.confirmation_ms}",
+                         message=(
+                "📈 Saudi AI Sniper | فيبو الساعة / دخول 15د\n"
+                f"الشركة: {company_display_name(symbol,stock)} ({symbol})\n"
+                f"الدخول المشروط: {plan.entry:.2f} | الوقف: {plan.stop:.2f}\n"
+                f"أهداف جهة الربح: {' / '.join(f'{p:.2f}' for p in plan.targets)}\n"
+                f"الساعة قمة–قاع–قمة: {anchors}\n"
+                f"المستوى: {plan.tool} {plan.ratio*100:.1f}%\n"
+                "النسب: 0 / 23.6 / 38.2 / 78.6 / 100%\n"
+                "EMA 25/75/140 صاعدة على الساعة و15د؛ شمعة رفض مكتملة\n"
+                f"صافي تقديري للهدف الأول: {setup.estimated_net_reward*100:.2f}% بعد الرسوم المقدرة\n"
+                f"تأكيد 15د: {setup.confirmed_at:%H:%M} الرياض"))
+            sent += int(process_events([event],state,quote))
+        except Exception as exc:
+            LOG.warning("FIB DATA HOLD | symbol=%s error=%s",symbol,type(exc).__name__)
+    return sent
 
 
 def scan_ema_alerts(s, candidates, state):
@@ -553,12 +606,12 @@ def scan_once(force=False):
 
         valid += 1
         ema_candidates.append((stock, quote))
-        events = evaluate(symbol, stock, quote)
+        events = []  # Primary signals now come from scan_fib_alerts below.
 
         if events and process_events(events, state, quote):
             alerts += 1
 
-    ema_alerts = scan_ema_alerts(s, ema_candidates, state)
+    ema_alerts = scan_fib_alerts(s, ema_candidates, state)
     LOG.info(
         "Completed | watched=%d | fresh_quotes=%d | "
         "stocks_with_alerts=%d | ema_alerts=%d | errors=%d",
